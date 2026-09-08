@@ -7,6 +7,7 @@ Measurement-and-prediction study of target-conditioned Kubernetes pod-relocation
 - Harness (later): Go + client-go
 - Analysis (later): Python + LightGBM
 - Local closeout cluster: Multipass kubeadm — `deploy/local-vm/`
+- AWS closeout (IO PSI + registry ENI independence): `deploy/aws/` (`.\up.ps1` / `.\down.ps1`)
 - Harness iteration: kind — `deploy/kind/`
 
 All four Stage 0 probes are implemented: `schedprobe`, `psiprobe`, `imageprobe`, `uidprobe`. TTFS rules are frozen in `docs/measurement-spec.md`.

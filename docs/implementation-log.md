@@ -148,3 +148,84 @@ Messier trail than the Stage 0 pass/fail artifacts under `experiments/results/st
 **Fix.** Spec updated; `cmd/stage0/uidprobe` + `internal/disrupt` + `probe/uidserver` implemented (Stage 0 default image: inline Python on `python:3.12-alpine` with Downward API `POD_UID`). First run lost ClusterIP samples because cancelling the load context killed HostExec early; load now runs to completion on a detached context. Artifact: `experiments/results/stage0/uid-pinned-ttfs-localvm.md`.
 
 **Follow-up (decomposition magnitudes).** Construct-run ClusterIP 2134 ms < pod-IP 2446 ms looked mechanistically backwards. Eight fair dual-poller repeats (`-suite decomp-repeat`): 5 near-ties (|Δ|≤5 ms), 3 with ClusterIP slower by ~465–475 ms, **0** with pod-IP meaningfully slower. Verdict: noise; single-trial pair is illustrative only. Pinning/overlap numbers untouched.
+
+---
+
+### 13. AWS deploy path for IO PSI and registry ENI independence
+
+**What happened.** Multipass cannot close IO PSI (one host disk) or registry-vs-pod-network independence (one NIC). Added `deploy/aws/` mirroring `deploy/local-vm/`: Terraform VPC with primary + registry subnets, `m6i.large` CP + `c6id.xlarge` workers, secondary ENI per worker, NVMe mounted at `/mnt/reloc-nvme`, one-command `up.ps1` / `down.ps1`.
+
+**Deviations from `k8s-node-common.sh`.** Kept that script for kubeadm/containerd; AWS-only work is `aws-node-prep.sh` (NVMe + secondary ENI netplan, `rp_filter=2`, source/dest check off in Terraform). Ubuntu 24.04 Noble AMI (not Multipass 22.04).
+
+**Probe hooks.** `psiprobe -skip-io-isolation=false -io-path /mnt/reloc-nvme`; new `netprobe` shapes `ens6` only and asserts `ens5` stable. Budget: treat $85 alert as stop → `.\down.ps1`.
+
+**Key handling.** `up.ps1` never copies `reloc-disrupt-key.pem` onto the CP. Join token is captured from CP stdout (`JOIN_BEGIN`/`JOIN_END`) and `kubeadm join` runs on each worker via the operator’s existing SSH — same path as `k8s-node-common.sh`.
+
+---
+
+### 14. AWS Stage 0 closeout session (account → probes → gates closed)
+
+Single session trail from first AWS bring-up through closing the two AWS-only Stage 0 gates. Earlier piecemeal notes on logical-vs-physical ENI isolation and memory-PSI zero-signal are folded here rather than kept as separate §14/§15.
+
+#### 1. Free Plan blocked non-free-tier instance types
+
+**What happened.** New AWS account (post July 2025 Free Plan) refused the Terraform instance types needed for Stage 0 (`c6id.xlarge` / `m6i.large`) despite unused vCPU quota headroom.
+
+**Root cause.** Free Plan accounts can block non-free-tier EC2 types outright; that is not a Service Quotas ceiling.
+
+**Fix.** Upgrade Free Plan → Paid Plan in the Billing console. A Service Quotas request was the wrong lever (tried first, then corrected).
+
+#### 2. PowerShell `$ErrorActionPreference = "Stop"` + native ssh/scp stderr
+
+**What happened.** `up.ps1` aborted on ssh/scp even when the remote command succeeded (exit 0).
+
+**Root cause.** Under `Stop`, PowerShell promotes native-command stderr text to a script-terminating error. Redirecting with `2>$null` is documented as unreliable in that mode.
+
+**Fix.** Route all ssh/scp through `Start-Process` with redirected output files and explicit exit-code checks (`Invoke-Native`), not automatic stderr promotion.
+
+#### 3. Transient SSH timeouts on bring-up
+
+**What happened.** Two separate runs hit brief SSH timeouts on different nodes; manual recheck showed the nodes were fine.
+
+**Fix.** `Invoke-Remote` / `Send-File` retry 3× with 5/10/15 s backoff.
+
+#### 4. `gpg --dearmor` hung on re-provision
+
+**What happened.** Re-running `k8s-node-common.sh` on an already-provisioned node stopped on an interactive overwrite prompt with no tty.
+
+**Fix.** `gpg --batch --yes --dearmor`. Same change on the local-VM copy (latent there too).
+
+#### 5. `config/paths.env` CRLF
+
+**What happened.** `.sh` scripts were LF-normalized before transfer; `paths.env` was not, so `source` failed on Linux.
+
+**Fix.** Include `paths.env` in the normalization loop; `.gitattributes` forces LF for `*.sh` and `paths.env`.
+
+#### 6. Memory PSI: readiness bug, then a real zero-signal characteristic
+
+**Two distinct issues.**
+
+**(a) False “no usable signal”.** `WaitPodRunning` returned once the container was Running, before host `stress-ng` was necessarily allocating; the 5 s sample clock started immediately and could miss the whole stall window. Fixed with `WaitHostStressNG` (`pgrep` until stress-ng is live) before starting the sample clock, plus stress-pod log capture on the JSONL record.
+
+**(b) Genuine zero PSI under real stress.** After (a), manual out-of-band `/proc/pressure/memory` reads still showed **unchanged total stall across ~20 s** while stress-ng held ~7.2–7.4 GB resident on a ~7.6 GiB `c6id.xlarge`. Likely cause: ~2.9 GiB reclaimable page cache let the kernel satisfy demand via fast eviction with no task stall. Environment healthy: clean `dmesg`, no OOM kills, no swap (`swapon` empty). Probe now records `swapon` + `dmesg_oom` on every memory-isolation row. This is the strong form of the local-VM shallow-memory-PSI finding (entry 5): signal strength depends on page-cache headroom relative to demand, not only MemAvailable arithmetic. Paper Discussion / feature-reliability material — not a measurement bug. No Stage 0 “fix” for the kernel behavior.
+
+#### 7. netprobe iperf3 killed by HostExec cgroup teardown
+
+**What happened.** After the `ss -ltn` readiness fix, failures still showed raw client `connection refused` (not “server not listening”). On the server node, `/tmp/iperf-s.log` existed but was **0 bytes** — bind had happened, then the process died before flushing a banner.
+
+**Root cause.** HostExec nsenter enters pid/mount/net (not cgroup). `nohup iperf3 -s -1 … &` then return left the server in the wrapper pod’s cgroup; deleting that pod after readiness killed iperf3 before the client HostExec ran. Same failure class as multipass exec killing backgrounded stress (entry 3), different transport. `-1` was secondary; detachment semantics were the bug.
+
+**Fix.** Match the memory-stress pattern: long-lived privileged pod, host `iperf3 -s` in the **foreground** for the test duration (no background-and-return). Listen-poll while that pod stays Running; delete after the client finishes.
+
+#### Registry path claim (logical isolation)
+
+`c6id.xlarge` has **Maximum Network Cards: 1** — primary and secondary ENIs share one physical NIC. Shaping is downward-only (`tbf` 20 Mbit + `netem` 100 ms on the registry iface). Claim: logically isolated via per-iface shaping / `rp_filter`, with raw deltas on the record — not unqualified physical independence. Boolean thresholds remain operational sanity alongside signed `shaping_raw_deltas`.
+
+#### Final result — Stage 0 closed on AWS
+
+Both AWS-only Stage 0 gates closed with measured magnitudes, not booleans alone:
+
+- **`isolation_io`:** pass — `stressed_delta_us` 13 045 678 vs control flat (NVMe path).
+- **`netprobe`:** pass — primary iface ≈ +0.00 ms RTT / +0.1% BW (noise; isolated); registry iface +200.04 ms RTT / −100% BW (matches 100 ms netem + 20 Mbit tbf by design).
+
+**Stage 0 is closed.** Next: experimental campaign (LightGBM training, calibration/evaluation replicate split, GapCaptured) — not started.

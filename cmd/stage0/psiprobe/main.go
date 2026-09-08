@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"reloc-disrupt/internal/k8s"
@@ -27,7 +28,8 @@ func main() {
 		namespace    = flag.String("namespace", "reloc-stage0", "namespace")
 		outPath      = flag.String("out", "experiments/results/stage0/psiprobe.jsonl", "JSONL output")
 		stressSec    = flag.Int("stress-sec", 45, "stress duration seconds")
-		skipIO       = flag.Bool("skip-io-isolation", true, "IO PSI isolation not closeable on shared-disk local-VM")
+		skipIO       = flag.Bool("skip-io-isolation", true, "IO PSI isolation not closeable on shared-disk local-VM; set false on AWS NVMe")
+		ioPath       = flag.String("io-path", "/mnt/reloc-nvme", "host mount path for IO stress (AWS instance-store NVMe)")
 		skipStress   = flag.Bool("skip-stress", false, "only collect PSI snapshots (no isolation)")
 	)
 	flag.Parse()
@@ -108,14 +110,16 @@ func main() {
 	record("isolation_memory", memPass, memDetail, memErr)
 
 	if !*skipIO {
-		record("isolation_io", false, map[string]any{
-			"reason": "IO PSI isolation not closeable on shared physical disk; refuse emit",
-		}, fmt.Errorf("io isolation not runnable on this host"))
+		ioGate, ioDetail, ioErr := runIOIsolation(ctx, cs, cfg, *namespace, stressed, control, *stressSec, *ioPath)
+		ioPass := ioErr == nil && ioGate.Emit
+		ioDetail["feature_gate"] = ioGate
+		ioDetail["io_path"] = *ioPath
+		record("isolation_io", ioPass, ioDetail, ioErr)
 	} else {
 		ioGate := nodeobs.RefuseOrEmit("io", false, "not closeable on shared-disk local-VM (skipped)", nodeobs.PSISome{})
 		record("isolation_io_skipped_fail_loud", true, map[string]any{
 			"feature_gate": ioGate,
-			"note":         "probe refuses to emit io as target-node feature",
+			"note":         "probe refuses to emit io as target-node feature; on AWS use -skip-io-isolation=false -io-path /mnt/reloc-nvme",
 		}, nil)
 	}
 
@@ -196,6 +200,19 @@ func runCPUIsolation(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Co
 
 func runMemoryIsolation(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, ns, stressed, control string, stressSec int) (nodeobs.FeatureGate, map[string]any, error) {
 	detail := map[string]any{"stressed": stressed, "control": control}
+	// Permanent run record: swap + OOM evidence, pass or fail.
+	defer func() {
+		swapOut, oomOut, diagErr := nodeobs.HostMemoryDiagnostics(context.Background(), cs, cfg, ns, stressed)
+		detail["swapon"] = swapOut
+		detail["dmesg_oom"] = oomOut
+		if diagErr != nil {
+			detail["memory_diagnostics_error"] = diagErr.Error()
+		}
+		if swapOut == "" {
+			detail["swapon_empty"] = true // no swap devices (or swapon produced no rows)
+		}
+	}()
+
 	// Re-read live MemAvailable immediately before sizing (not a %% of MemTotal).
 	avail, err := nodeobs.MemAvailableKiB(ctx, cs, cfg, ns, stressed)
 	if err != nil {
@@ -236,13 +253,32 @@ func runMemoryIsolation(ctx context.Context, cs *kubernetes.Clientset, cfg *rest
 	}()
 
 	if err := k8s.WaitPodRunning(ctx, cs, ns, pod.Name, 5*time.Minute); err != nil {
+		logs, _ := k8s.PodLogs(ctx, cs, ns, pod.Name, "stress", 200)
+		detail["stress_pod_logs"] = truncateRunes(logs, 4000)
 		return nodeobs.FeatureGate{}, detail, fmt.Errorf("stress pod: %w", err)
 	}
+
+	// Functional readiness: stress-ng must be in the host process table before
+	// the sample clock starts. WaitPodRunning alone races apt-get / exec.
+	readyWait := time.Now()
+	pgrepOut, err := nodeobs.WaitHostStressNG(ctx, cs, cfg, ns, stressed, 3*time.Minute)
+	detail["stress_ready_wait_sec"] = time.Since(readyWait).Seconds()
+	detail["stress_ng_pgrep"] = pgrepOut
+	logs, logErr := k8s.PodLogs(ctx, cs, ns, pod.Name, "stress", 200)
+	if logErr == nil {
+		detail["stress_pod_logs"] = truncateRunes(logs, 4000)
+	} else {
+		detail["stress_pod_logs_error"] = logErr.Error()
+	}
+	if err != nil {
+		return nodeobs.FeatureGate{}, detail, fmt.Errorf("stress-ng not ready (sample clock not started): %w", err)
+	}
+
 	stressStart := time.Now()
 	// Manual runs: nearly all stall in first ~8s, then flat. Sample early (5s),
 	// before HostExec latency pushes us into the flat region for diagnostics —
 	// cumulative total should still rise if sizing worked; early sample matches
-	// the known shape.
+	// the known shape. Clock starts only after stress-ng is confirmed running.
 	time.Sleep(5 * time.Second)
 	detail["sample_offset_sec"] = time.Since(stressStart).Seconds()
 
@@ -254,6 +290,9 @@ func runMemoryIsolation(ctx context.Context, cs *kubernetes.Clientset, cfg *rest
 	detail["stress_phase_at_sample"] = string(p.Status.Phase)
 	if p.Status.Phase != corev1.PodRunning {
 		detail["stress_not_running"] = true
+	}
+	if midLogs, midErr := k8s.PodLogs(ctx, cs, ns, pod.Name, "stress", 200); midErr == nil {
+		detail["stress_pod_logs_at_sample"] = truncateRunes(midLogs, 4000)
 	}
 
 	// Stressed node first so the early window is prioritized over control.
@@ -288,6 +327,70 @@ func runMemoryIsolation(ctx context.Context, cs *kubernetes.Clientset, cfg *rest
 	return gate, detail, nil
 }
 
+func runIOIsolation(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, ns, stressed, control string, stressSec int, ioPath string) (nodeobs.FeatureGate, map[string]any, error) {
+	detail := map[string]any{
+		"stressed": stressed, "control": control, "io_path": ioPath,
+		"requirement": "stress dedicated NVMe mount (not root EBS); control worker IO PSI stays flat",
+	}
+	beforeS, err := nodeobs.CollectProcPressure(ctx, cs, cfg, ns, stressed)
+	if err != nil {
+		return nodeobs.FeatureGate{}, detail, err
+	}
+	beforeC, err := nodeobs.CollectProcPressure(ctx, cs, cfg, ns, control)
+	if err != nil {
+		return nodeobs.FeatureGate{}, detail, err
+	}
+	s0, okS := nodeobs.FindSome(beforeS, "io")
+	c0, okC := nodeobs.FindSome(beforeC, "io")
+	if !okS || !okC {
+		return nodeobs.FeatureGate{}, detail, fmt.Errorf("missing io PSI baseline")
+	}
+
+	pod, desc, err := nodeobs.StartIOStress(ctx, cs, ns, stressed, ioPath, stressSec)
+	if err != nil {
+		return nodeobs.FeatureGate{}, detail, err
+	}
+	detail["stress_desc"] = desc
+	detail["stress_pod"] = pod.Name
+	defer func() {
+		_ = cs.CoreV1().Pods(ns).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+	}()
+	if err := k8s.WaitPodRunning(ctx, cs, ns, pod.Name, 3*time.Minute); err != nil {
+		return nodeobs.FeatureGate{}, detail, fmt.Errorf("io stress pod: %w", err)
+	}
+
+	wait := time.Duration(stressSec/2) * time.Second
+	if wait < 5*time.Second {
+		wait = 5 * time.Second
+	}
+	time.Sleep(wait)
+
+	midS, err := nodeobs.CollectProcPressure(ctx, cs, cfg, ns, stressed)
+	if err != nil {
+		return nodeobs.FeatureGate{}, detail, err
+	}
+	midC, err := nodeobs.CollectProcPressure(ctx, cs, cfg, ns, control)
+	if err != nil {
+		return nodeobs.FeatureGate{}, detail, err
+	}
+	s1, okS := nodeobs.FindSome(midS, "io")
+	c1, okC := nodeobs.FindSome(midC, "io")
+	if !okS || !okC {
+		return nodeobs.FeatureGate{}, detail, fmt.Errorf("missing io PSI mid-sample")
+	}
+	dS := s1.Total - s0.Total
+	dC := c1.Total - c0.Total
+	detail["stressed_delta_us"] = dS
+	detail["control_delta_us"] = dC
+
+	isolated, reason := nodeobs.IsolationPass(dS, dC, 100_000) // 100ms stall µs minimum
+	gate := nodeobs.RefuseOrEmit("io", isolated, reason, s1)
+	if !isolated {
+		return gate, detail, fmt.Errorf("%s", reason)
+	}
+	return gate, detail, nil
+}
+
 func keysOf(m map[string]any) []string {
 	if m == nil {
 		return nil
@@ -297,6 +400,14 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func truncateRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func softFailReason(detail map[string]any) string {

@@ -1,7 +1,8 @@
-.PHONY: help schedprobe psiprobe imageprobe imageprobe-layer-share uidprobe uidprobe-decomp-repeat test
+.PHONY: help schedprobe psiprobe imageprobe imageprobe-layer-share uidprobe uidprobe-decomp-repeat netprobe test
 
 help:
-	@echo "Stage 0 probes: make schedprobe | psiprobe | imageprobe | imageprobe-layer-share | uidprobe | uidprobe-decomp-repeat"
+	@echo "Stage 0 probes: make schedprobe | psiprobe | imageprobe | imageprobe-layer-share | uidprobe | uidprobe-decomp-repeat | netprobe"
+	@echo "AWS cluster: cd deploy/aws && ./up.ps1   # tear down: ./down.ps1"
 	@echo "Registry + ground-truth images: deploy/registry/bringup.ps1"
 
 test:
@@ -24,3 +25,6 @@ uidprobe:
 
 uidprobe-decomp-repeat:
 	go run ./cmd/stage0/uidprobe -suite decomp-repeat -repeats 8
+
+netprobe:
+	go run ./cmd/stage0/netprobe

@@ -13,6 +13,18 @@ admin.conf
 .env.*
 .kube/
 
+# AWS terraform local state / outputs / operator tfvars (never commit)
+deploy/aws/terraform/.terraform/
+deploy/aws/terraform/*.tfstate
+deploy/aws/terraform/*.tfstate.*
+deploy/aws/terraform/.terraform.lock.hcl
+deploy/aws/terraform/terraform.tfvars
+deploy/aws/terraform/tfplan
+deploy/aws/terraform/*.tfplan
+deploy/aws/terraform-outputs.json
+deploy/aws/.kube/
+*.pem
+
 # Go / Python build noise
 *.exe
 *.test

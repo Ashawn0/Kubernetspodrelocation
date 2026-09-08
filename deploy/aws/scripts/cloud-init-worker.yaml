@@ -1,0 +1,11 @@
+#cloud-config
+hostname: ${hostname}
+manage_etc_hosts: true
+package_update: true
+packages:
+  - jq
+  - iperf3
+  - iproute2
+  - nvme-cli
+runcmd:
+  - [bash, -c, "echo 'reloc-disrupt worker cloud-init done' > /var/log/reloc-cloud-init.done"]

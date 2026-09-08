@@ -93,6 +93,27 @@ func HostExec(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, n
 	return ExecInPod(ctx, cs, cfg, namespace, created.Name, "nsenter", full)
 }
 
+// PodLogs returns recent container logs (stdout+stderr merged by kubelet).
+func PodLogs(ctx context.Context, cs *kubernetes.Clientset, namespace, name, container string, tailLines int64) (string, error) {
+	opts := &corev1.PodLogOptions{}
+	if container != "" {
+		opts.Container = container
+	}
+	if tailLines > 0 {
+		opts.TailLines = &tailLines
+	}
+	stream, err := cs.CoreV1().Pods(namespace).GetLogs(name, opts).Stream(ctx)
+	if err != nil {
+		return "", fmt.Errorf("pod logs %s/%s: %w", namespace, name, err)
+	}
+	defer stream.Close()
+	b, err := io.ReadAll(stream)
+	if err != nil {
+		return "", fmt.Errorf("read pod logs %s/%s: %w", namespace, name, err)
+	}
+	return string(b), nil
+}
+
 // ExecInPod runs a command in an existing container and returns combined stdout+stderr.
 func ExecInPod(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, namespace, pod, container string, command []string) (string, error) {
 	req := cs.CoreV1().RESTClient().Post().

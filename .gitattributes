@@ -1,3 +1,5 @@
-# Force LF for shell scripts so Multipass/Ubuntu bash never sees CRLF
-# (see docs/implementation-log.md entry 1).
+# Force LF for shell scripts and sourced env files so Ubuntu bash never sees CRLF
+# (see docs/implementation-log.md entry 1; AWS paths.env hit the same class of bug).
 *.sh text eol=lf
+**/paths.env text eol=lf
+deploy/aws/config/paths.env text eol=lf

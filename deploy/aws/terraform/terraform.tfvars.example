@@ -1,0 +1,12 @@
+# Required: copy to terraform.tfvars (gitignored) or let up.ps1 write it.
+# operator_cidr MUST be your public IP/32 — terraform rejects 0.0.0.0/0.
+
+region        = "ap-northeast-2"
+key_name      = "reloc-disrupt-key"
+operator_cidr = "YOUR.PUBLIC.IP/32"
+
+# Optional:
+# name_prefix          = "reloc-disrupt"
+# cp_instance_type     = "m6i.large"
+# worker_instance_type = "c6id.xlarge"
+# worker_count         = 2

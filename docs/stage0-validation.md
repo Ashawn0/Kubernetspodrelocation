@@ -6,23 +6,26 @@ Local environments:
 
 - **kind** — shared kernel (Docker/WSL VM). Plumbing rehearsal. Weak or invalid for node-local PSI and registry isolation.
 - **local-VM** — Multipass kubeadm (`deploy/local-vm/`), separate guest kernels, shared **host** disk and NIC.
-- **lab / university kubeadm** — required for IO PSI and registry-vs-pod-network independence.
+- **AWS kubeadm** — `deploy/aws/`: real EC2 (`m6i.large` CP + `c6id.xlarge` workers), local NVMe for IO PSI, secondary ENI for registry shaping. Preferred closeout path when lab kubeadm is unavailable.
+- **lab / university kubeadm** — alternate for IO PSI and registry-vs-pod-network independence.
 
 ## Transfer table
 
 Closeable here means Stage 0 for that instrument can be **finished** on that environment.
 
-| Instrument | kind plumbing | kind construct | local-VM (Multipass kubeadm) | lab / university kubeadm |
-| --- | --- | --- | --- | --- |
-| Scheduler path (`nodeSelector` bind) | yes | yes | **confirmed pass**, see [experiments/results/stage0/scheduler-path-localvm.md](../experiments/results/stage0/scheduler-path-localvm.md) | smoke only |
-| UID-pinned TTFS | yes | yes if overlap proven | **confirmed pass**, see [uid-pinned-ttfs-localvm.md](../experiments/results/stage0/uid-pinned-ttfs-localvm.md) (`Connection: close`; ClusterIP + pod-IP both reported) | smoke only |
-| Uncached image bytes | yes | yes (per-node containerd) | **confirmed pass (layer-sharing divergence validated)**, see [layer-sharing-divergence-localvm.md](../experiments/results/stage0/layer-sharing-divergence-localvm.md); plumbing-only pause run is separate (cold/warm CRI accounting, not sharing) | confirm same containerd GC setting |
-| CPU PSI | plumbing | often not (shared kernel) | **confirmed pass (automated, psiprobe)**; manual evidence [cpu-psi-isolation-localvm.md](../experiments/results/stage0/cpu-psi-isolation-localvm.md) | required if local-VM isolation fails |
-| Memory PSI | plumbing | often not | **confirmed pass (automated, psiprobe)**; manual evidence [memory-psi-isolation-localvm.md](../experiments/results/stage0/memory-psi-isolation-localvm.md) (shallow; automated delta weaker than manual — see artifact) | required if local-VM isolation fails |
-| IO PSI | plumbing | no (shared disk) | **not closeable on this machine** (one physical disk) | **required** |
-| Registry vs pod-network independence | maybe | weak | **not closeable on this machine** (one NIC) | **required** (or cloud fallback) |
+| Instrument | kind plumbing | kind construct | local-VM (Multipass kubeadm) | AWS kubeadm (`deploy/aws`) | lab / university kubeadm |
+| --- | --- | --- | --- | --- | --- |
+| Scheduler path (`nodeSelector` bind) | yes | yes | **confirmed pass**, see [experiments/results/stage0/scheduler-path-localvm.md](../experiments/results/stage0/scheduler-path-localvm.md) | smoke / reconfirm | smoke only |
+| UID-pinned TTFS | yes | yes if overlap proven | **confirmed pass**, see [uid-pinned-ttfs-localvm.md](../experiments/results/stage0/uid-pinned-ttfs-localvm.md) | smoke / reconfirm | smoke only |
+| Uncached image bytes | yes | yes (per-node containerd) | **confirmed pass (layer-sharing divergence validated)**, see [layer-sharing-divergence-localvm.md](../experiments/results/stage0/layer-sharing-divergence-localvm.md) | reconfirm `discard_unpacked_layers` | confirm same containerd GC setting |
+| CPU PSI | plumbing | often not (shared kernel) | **confirmed pass (automated, psiprobe)** | reconfirm | required if local-VM isolation fails |
+| Memory PSI | plumbing | often not | **confirmed pass (automated, psiprobe)** | reconfirm | required if local-VM isolation fails |
+| IO PSI | plumbing | no (shared disk) | **not closeable on this machine** (one physical disk) | **closeable** — NVMe at `/mnt/reloc-nvme`; `psiprobe -skip-io-isolation=false -io-path /mnt/reloc-nvme` | **required** (or use AWS) |
+| Registry vs pod-network independence | maybe | weak | **not closeable on this machine** (one NIC) | **closeable** — secondary ENI + `netprobe` | **required** (or use AWS) |
 
 UID TTFS is **confirmed** on the local-VM topology (artifact above). Re-run: `go run ./cmd/stage0/uidprobe` (or `make uidprobe`) against a Multipass kubeconfig.
+
+AWS lifecycle (budget stop = one command): `deploy/aws/up.ps1` then `deploy/aws/down.ps1`. Treat a manual **$85** alert as the stop signal.
 
 ## Claims (summary)
 
@@ -55,7 +58,15 @@ Ground-truth layered images via in-cluster registry; per-node containerd; sharin
 
 ### 2.6 Registry vs pod network
 
-Not closeable on this workstation. Defer to lab kubeadm or cloud.
+Not closeable on Multipass (one NIC). On AWS (`deploy/aws/`): secondary ENI in a dedicated registry subnet; `tc` on that iface only; `go run ./cmd/stage0/netprobe` must show primary path stable while registry path degrades.
+
+### 2.4 IO PSI (AWS)
+
+Not closeable on Multipass. On AWS workers: instance-store NVMe mounted at `/mnt/reloc-nvme`. Run:
+
+```text
+go run ./cmd/stage0/psiprobe -skip-io-isolation=false -io-path /mnt/reloc-nvme
+```
 
 ## Post-provision verification (local-VM)
 
