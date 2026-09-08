@@ -1,0 +1,260 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: build-layer-images
+  namespace: reloc-registry
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: build-layer-images
+  namespace: reloc-registry
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-layer-images
+  namespace: reloc-registry
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: build-layer-images
+subjects:
+  - kind: ServiceAccount
+    name: build-layer-images
+    namespace: reloc-registry
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-layer-images
+  namespace: reloc-registry
+  labels:
+    app: build-layer-images
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: build-layer-images
+    spec:
+      serviceAccountName: build-layer-images
+      restartPolicy: Never
+      containers:
+        - name: build
+          image: quay.io/buildah/stable:v1.37.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: REGISTRY
+              value: registry.reloc-registry.svc.cluster.local:5000
+            - name: REPO_PREFIX
+              value: reloc
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "Building ground-truth layer images into ${REGISTRY}/${REPO_PREFIX}/..."
+
+              WORK=/work
+              mkdir -p "$WORK"
+              cd "$WORK"
+
+              # Deterministic high-entropy payloads (not urandom, not LCG low bits) so
+              # compressed blob sizes are stable and not accidentally tiny.
+              # Ground-truth assertions use compressed manifest layer sizes after push.
+              python3 - <<'PY'
+              import hashlib
+              from pathlib import Path
+
+              def write(path, n, label):
+                  # Concatenate SHA-256(label || counter) until we have n bytes.
+                  # Still fully deterministic; avoids LCG low-bit periodicity that compresses well.
+                  out = bytearray()
+                  counter = 0
+                  prefix = label.encode()
+                  while len(out) < n:
+                      h = hashlib.sha256(prefix + counter.to_bytes(8, "big")).digest()
+                      out.extend(h)
+                      counter += 1
+                  Path(path).write_bytes(out[:n])
+                  print(f"wrote {path} bytes={n}", flush=True)
+
+              write("L0", 1 * 1024 * 1024, "L0")  # 1 MiB
+              write("L1", 2 * 1024 * 1024, "L1")  # 2 MiB
+              write("L2", 3 * 1024 * 1024, "L2")  # 3 MiB
+              PY
+
+              cat > Dockerfile.base <<'EOF'
+              FROM scratch
+              COPY L0 /L0
+              EOF
+              cat > Dockerfile.app-a <<'EOF'
+              FROM scratch
+              COPY L0 /L0
+              COPY L1 /L1
+              EOF
+              cat > Dockerfile.app-b <<'EOF'
+              FROM scratch
+              COPY L0 /L0
+              COPY L2 /L2
+              EOF
+
+              # buildah needs storage; use vfs in this ephemeral job.
+              # --layers is required: without it, buildah flattens multi-COPY images into one layer.
+              export STORAGE_DRIVER=vfs
+              buildah bud --layers --timestamp=0 --format=docker -f Dockerfile.base -t "${REGISTRY}/${REPO_PREFIX}/base:v1" .
+              buildah bud --layers --timestamp=0 --format=docker -f Dockerfile.app-a -t "${REGISTRY}/${REPO_PREFIX}/app-a:v1" .
+              buildah bud --layers --timestamp=0 --format=docker -f Dockerfile.app-b -t "${REGISTRY}/${REPO_PREFIX}/app-b:v1" .
+
+              buildah push --tls-verify=false "${REGISTRY}/${REPO_PREFIX}/base:v1" "docker://${REGISTRY}/${REPO_PREFIX}/base:v1"
+              buildah push --tls-verify=false "${REGISTRY}/${REPO_PREFIX}/app-a:v1" "docker://${REGISTRY}/${REPO_PREFIX}/app-a:v1"
+              buildah push --tls-verify=false "${REGISTRY}/${REPO_PREFIX}/app-b:v1" "docker://${REGISTRY}/${REPO_PREFIX}/app-b:v1"
+
+              echo "Pushed base, app-a, app-b"
+
+              # Record compressed layer sizes from registry manifests (ground truth for imageprobe).
+              python3 - <<'PY'
+              import json, os, sys, urllib.request
+
+              reg = os.environ["REGISTRY"]
+              prefix = os.environ["REPO_PREFIX"]
+
+              def fetch_raw(repo, tag):
+                  url = f"http://{reg}/v2/{prefix}/{repo}/manifests/{tag}"
+                  req = urllib.request.Request(url, headers={
+                      "Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
+                  })
+                  with urllib.request.urlopen(req) as r:
+                      return r.read()
+
+              def manifest(repo, tag):
+                  return json.loads(fetch_raw(repo, tag))
+
+              def layers(m):
+                  out = []
+                  for layer in m.get("layers") or []:
+                      out.append({"digest": layer["digest"], "size": int(layer["size"])})
+                  return out
+
+              raw = {}
+              mani = {}
+              for name in ("base", "app-a", "app-b"):
+                  raw[name] = fetch_raw(name, "v1")
+                  mani[name] = json.loads(raw[name])
+
+              base = layers(mani["base"])
+              a = layers(mani["app-a"])
+              b = layers(mani["app-b"])
+
+              print("=== layer summary ===", flush=True)
+              for name, ly in (("base", base), ("app-a", a), ("app-b", b)):
+                  print(f"{name}: count={len(ly)}", flush=True)
+                  for i, layer in enumerate(ly):
+                      print(f"  [{i}] digest={layer['digest']} size={layer['size']}", flush=True)
+
+              def fail(msg, repo):
+                  print(f"FAIL: {msg}", flush=True)
+                  print(f"=== raw manifest JSON ({repo}) ===", flush=True)
+                  print(raw[repo].decode(), flush=True)
+                  sys.exit(1)
+
+              if len(base) != 1:
+                  fail(f"base want 1 layer, got {base}", "base")
+              if len(a) != 2:
+                  fail(f"app-a want 2 layers, got {a}", "app-a")
+              if len(b) != 2:
+                  fail(f"app-b want 2 layers, got {b}", "app-b")
+
+              # L0 digest must be identical across base, app-a, app-b (layer-sharing claim).
+              l0 = base[0]["digest"]
+              print(f"L0 digest (from base): {l0}", flush=True)
+              if a[0]["digest"] != l0:
+                  fail(f"app-a[0] digest {a[0]['digest']} != base L0 {l0}", "app-a")
+              if b[0]["digest"] != l0:
+                  fail(f"app-b[0] digest {b[0]['digest']} != base L0 {l0}", "app-b")
+              print("L0 digest identical across base, app-a, app-b: OK", flush=True)
+
+              # Compressed sizes should be substantial (SHA-256 stream), not LCG-tiny.
+              for label, size in (("L0", base[0]["size"]), ("L1", a[1]["size"]), ("L2", b[1]["size"])):
+                  print(f"{label} compressed blob size={size}", flush=True)
+                  if size < 100_000:
+                      fail(f"{label} compressed size {size} looks too small (<100KiB); payload may still be compressing away", "app-a")
+
+              gt = {
+                  "registry": reg,
+                  "repo_prefix": prefix,
+                  "file_bytes": {"L0": 1048576, "L1": 2097152, "L2": 3145728},
+                  "layer_blob_bytes": {
+                      "L0": base[0]["size"],
+                      "L1": a[1]["size"],
+                      "L2": b[1]["size"],
+                  },
+                  "digests": {
+                      "L0": base[0]["digest"],
+                      "L1": a[1]["digest"],
+                      "L2": b[1]["digest"],
+                  },
+                  "images": {
+                      "base": f"{reg}/{prefix}/base:v1",
+                      "app_a": f"{reg}/{prefix}/app-a:v1",
+                      "app_b": f"{reg}/{prefix}/app-b:v1",
+                  },
+                  "notes": [
+                      "Assertions use layer_blob_bytes (compressed OCI/docker layer sizes from the registry manifest).",
+                      "file_bytes are the deterministic SHA-256-counter COPY payloads used to build those layers.",
+                      "buildah bud uses --layers so each COPY is a separate layer.",
+                  ],
+              }
+              Path = __import__("pathlib").Path
+              Path("/tmp/layer-ground-truth.json").write_text(json.dumps(gt, indent=2) + "\n")
+              print(json.dumps(gt, indent=2), flush=True)
+              PY
+
+              # Publish ground truth as ConfigMap for imageprobe
+              if command -v kubectl >/dev/null 2>&1; then
+                kubectl -n reloc-registry create configmap layer-ground-truth \
+                  --from-file=layer-ground-truth.json=/tmp/layer-ground-truth.json \
+                  --dry-run=client -o yaml | kubectl apply -f -
+              else
+                # buildah image may lack kubectl — use raw API with SA token
+                TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                NS=reloc-registry
+                HOST=https://kubernetes.default.svc
+                CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                BODY=$(python3 - <<'PY'
+              import json
+              from pathlib import Path
+              data = Path("/tmp/layer-ground-truth.json").read_text()
+              cm = {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "layer-ground-truth", "namespace": "reloc-registry"},
+                "data": {"layer-ground-truth.json": data},
+              }
+              print(json.dumps(cm))
+              PY
+                )
+                CODE=$(curl -sS -o /tmp/cm.out -w "%{http_code}" --cacert "$CACERT" -H "Authorization: Bearer $TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -X POST "$HOST/api/v1/namespaces/$NS/configmaps" -d "$BODY" || true)
+                if [ "$CODE" = "409" ]; then
+                  curl -sS --cacert "$CACERT" -H "Authorization: Bearer $TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -X PUT "$HOST/api/v1/namespaces/$NS/configmaps/layer-ground-truth" -d "$BODY" >/dev/null
+                fi
+                echo "ConfigMap layer-ground-truth upserted (HTTP $CODE)"
+              fi
+              echo "DONE"
+          volumeMounts:
+            - name: varlib
+              mountPath: /var/lib/containers
+      volumes:
+        - name: varlib
+          emptyDir: {}

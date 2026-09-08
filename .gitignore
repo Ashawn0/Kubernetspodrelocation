@@ -1,0 +1,36 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+
+# Credentials / local cluster configs (never commit)
+admin.conf
+*.kubeconfig
+*.kubeconfig.*
+.env
+.env.*
+.kube/
+
+# Go / Python build noise
+*.exe
+*.test
+*.out
+bin/
+dist/
+.venv/
+venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+*.pyc
+
+# Experiment outputs (keep directory markers + Stage 0 markdown artifacts)
+experiments/results/stage0/*
+!experiments/results/stage0/.gitkeep
+!experiments/results/stage0/*.md
+experiments/results/calibration/*
+!experiments/results/calibration/.gitkeep
+experiments/results/evaluation/*
+!experiments/results/evaluation/.gitkeep
