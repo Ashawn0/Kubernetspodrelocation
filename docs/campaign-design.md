@@ -63,6 +63,16 @@ Randomized trial order made cross-trial contamination visible; the following are
 
 ---
 
+## 4b. Host-level CPU contention (hypervisor / steal-time blind spot)
+
+**Limitation.** Guest-internal Linux PSI (what `nodeobs` / trialrunner sample inside Multipass workers) does **not** observe hypervisor scheduling contention between VMs and host processes — often discussed as **steal time**. Browser, IDE, and other Windows-host activity on the same physical machine can lengthen TTFS without moving guest `avg10` at all.
+
+**Harness response.** Each trial records informational `host_cpu_pct_start` and `host_cpu_pct_end` from the Windows parent via `Get-Counter '\Processor(_Total)\% Processor Time'` (bookend samples; not a gate, delay policy, or fail condition). Analysis may treat them as covariates or exclusion flags.
+
+**Practical campaign mitigation.** Minimize host foreground load while trials run; use the new fields to detect residual contention that could not be avoided. Distinct from thermal ID 37 (§4) and from guest PSI cooldown/dwell (§4).
+
+---
+
 ## 5. Open statistical decisions
 
 Scaffolded in code; **not** finalized:
@@ -90,7 +100,7 @@ Until then: 15/cell is the harness default for that pilot only — not the final
 
 | Path | Role |
 | --- | --- |
-| `cmd/campaign/trialrunner` | dryrun + pilot; isolation, cooldown, dwell, thermal, CSV |
+| `cmd/campaign/trialrunner` | dryrun + pilot; isolation, cooldown, dwell, thermal, host CPU bookends, CSV |
 | `internal/baseline` | `fixed-cost`, `ImageLocality`, shared `Predictor` |
 | `internal/oracle` | cal/eval partition, empirical oracle scaffold |
 | `experiments/results/pilot/` | pilot CSV outputs (gitignored contents) |

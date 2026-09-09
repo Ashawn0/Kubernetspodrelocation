@@ -245,6 +245,7 @@ func runPilot(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, b
 		"ts_utc", "pass", "error",
 		"uncached_bytes", "psi_cpu_avg10", "psi_cpu_avg10_pretrial_baseline",
 		"thermal_throttle_events_during_trial", "thermal_throttle_detected",
+		"host_cpu_pct_start", "host_cpu_pct_end",
 		"target_node", "cache_image",
 	}
 	must(cw.Write(header))
@@ -305,12 +306,20 @@ func runPilot(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, b
 				thDet = fmt.Sprint(v)
 			}
 		}
+		hostStart := ""
+		hostEnd := ""
+		if v, ok := rec.Detail["host_cpu_pct_start"]; ok {
+			hostStart = fmtNum(v)
+		}
+		if v, ok := rec.Detail["host_cpu_pct_end"]; ok {
+			hostEnd = fmtNum(v)
+		}
 		row := []string{
 			sp.TrialID, "pilot", strconv.FormatInt(seed, 10), strconv.Itoa(sp.ExecOrder), strconv.Itoa(sp.Replicate),
 			string(sp.ImageCacheState), string(sp.CPUPSILevel), strconv.Itoa(sp.CPURatio),
 			fmtNum(rec.Detail["ttfs_clusterip_sec"]), fmtNum(rec.Detail["ttfs_podip_sec"]), fmtNum(rec.Detail["ttfs_naive_clusterip_sec"]),
 			ts, strconv.FormatBool(pass), errStr,
-			unc, avg10, preBaseline, thEvents, thDet, base.Target, base.Image,
+			unc, avg10, preBaseline, thEvents, thDet, hostStart, hostEnd, base.Target, base.Image,
 		}
 		must(cw.Write(row))
 		cw.Flush()
@@ -367,11 +376,17 @@ func runOneTrial(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config
 		Detail: detail,
 	}
 	defer func() {
-		// Early exits before TTFS: still record host thermal window for the attempt.
+		// Early exits: still record end-of-attempt host covariates.
+		if _, ok := detail["host_cpu_pct_end"]; !ok {
+			attachHostCPUEnd(detail)
+		}
 		if _, ok := detail["thermal_throttle_events_during_trial"]; !ok {
 			attachThermalThrottle(detail, trialWallStart, time.Now())
 		}
 	}()
+
+	// Host CPU at trial start (informational; never gates the trial).
+	attachHostCPUStart(detail)
 
 	suffix := fmt.Sprintf("%d-%d", sp.ExecOrder, time.Now().UnixNano()%1_000_000)
 	svcName := fmt.Sprintf("tr-svc-%s", suffix)
@@ -635,8 +650,8 @@ func runOneTrial(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config
 	detail["measure_duration_sec"] = time.Since(measureStart).Seconds()
 	detail["ts_utc"] = time.Now().UTC().Format(time.RFC3339Nano)
 
-	// Host thermal throttle (Kernel-Processor-Power ID 37) over this trial's wall window.
-	// Record-only: never fails or delays the trial; exclusion is an analysis choice.
+	// Host covariates (record-only): thermal events + host CPU bookends.
+	attachHostCPUEnd(detail)
 	attachThermalThrottle(detail, trialWallStart, time.Now())
 
 	if !okCIP || !okPIP {
