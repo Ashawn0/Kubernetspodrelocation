@@ -232,6 +232,18 @@ Both AWS-only Stage 0 gates closed with measured magnitudes, not booleans alone:
 
 ---
 
+### 15. `provision-cluster.ps1` failed when invoked from outside `deploy/local-vm`
+
+**What happened.** Running `.\deploy\local-vm\provision-cluster.ps1` from the repo root (or any cwd other than `deploy/local-vm`) failed on `multipass transfer` for `k8s-node-common.sh`: Multipass / the shell resolved the bare relative path against the **caller's** working directory, not the script's directory.
+
+**Root cause.** PowerShell does not change process cwd to `$PSScriptRoot` when you invoke a script by path. Sibling assets referenced as bare names (`k8s-node-common.sh`) are looked up relative to the caller's cwd.
+
+**Fix.** Anchor local file references with `Join-Path $PSScriptRoot ...` (and fail early with `Test-Path` if missing). Audit of `provision-cluster.ps1`: the only host-side sibling path was `k8s-node-common.sh`; remote guest paths (`/tmp/...`) and URL-fetched Calico stay as-is.
+
+**Lesson.** Same class as entry 2: never pass bare relative paths to external tools from a PowerShell script that must be runnable from any cwd — resolve against `$PSScriptRoot` first.
+
+---
+
 ### 16. `.gitattributes` LF rules do not rewrite already-committed CRLF
 
 **What happened.** `*.sh text eol=lf` (and `paths.env`) was already in `.gitattributes`, but `deploy/registry/configure-insecure-registry.sh` still produced the classic bash CRLF diagnostic (dollar-single-quote backslash-r / `command not found` on `\r`) under `multipass exec ... bash` on Ubuntu. Working-tree bytes had CRLF; with `core.autocrlf=true`, `git status` stayed clean because the clean filter hides CR on compare.
@@ -241,3 +253,41 @@ Both AWS-only Stage 0 gates closed with measured magnitudes, not booleans alone:
 **Fix.** Ran `git add --renormalize .` against the existing rules. Index/HEAD blobs for tracked `*.sh` / `paths.env` were already LF (nothing new to commit for those objects). Rewrote the dirty working-tree copy of `configure-insecure-registry.sh` (and `.gitattributes`) to LF and re-audited every tracked `.sh` for CR bytes — none remain.
 
 **Lesson.** Whenever an `eol=` rule is added, or a shell script is suspected of stale line endings: (1) `git add --renormalize .`, (2) byte-audit `*.sh` for CR (`\r`), (3) commit any resulting index changes as their own commit. Do not assume `.gitattributes` alone healed files that were wrong before the rule landed.
+
+---
+
+### 17. Fire-and-forget pod Delete() broke trial isolation under randomized pilot order
+
+**What happened.** Pilot cells that should have been unstressed (CPU PSI `none`) showed elevated host PSI, consistent with leftover load from a prior trial on the same node. Suspected after randomized execution order landed in trialrunner.
+
+**Root cause (code inspection; no isolated repro yet).** Between-trial teardown used `Pods.Delete(..., DeleteOptions{})` and returned immediately. Stress pods (`nodeobs.stressPod`) and leftover UID-server pods had no `TerminationGracePeriodSeconds` override (Kubernetes default 30s). `stress-ng` / the UID server do not exit early on SIGTERM, so they could still be alive for up to ~30s while the next trial’s setup and measurement already ran — contaminating PSI and potentially TTFS. Confirmed by reading `cmd/campaign/trialrunner` + `internal/nodeobs/collect.go`; not yet reproduced with a minimal single-node fixture.
+
+**Fix.** (1) Set `TerminationGracePeriodSeconds: 0` on `stressPod` and on trialrunner’s old/new UID-server pod specs (immediate SIGKILL is correct for these workloads; the disruption Delete of the old pod still passes an explicit `GracePeriodSeconds` in `DeleteOptions` so preStop overlap remains). (2) `cleanup()` and the stress-pod defer force-delete with `GracePeriodSeconds: 0` and poll until `Get` returns NotFound (15s bound, hard error on timeout) for every name cleaned (service + old + new + stress).
+
+**Lesson.** Once trial order is no longer blocked by cell, teardown must be synchronous and grace-aware. Fire-and-forget Delete is not isolation.
+
+---
+
+### 18. PSI avg10 timing: post-teardown bleed and mid-ramp stress samples
+
+**What happened.** An 18-trial pilot (`seed=42`) showed every `cpu_psi_level=none` cell that ran immediately after a stress cell with `avg10` ≈ 29–32, while every `none` cell after another non-stress cell had `avg10` < 1. Separately, `threshold` vs `high` did not separate as expected (e.g. warm_threshold ≈ 48 vs warm_high ≈ 38), and `cold_high` TTFS spread was wide (≈1.99–13.26s over 3 reps) vs tight spreads elsewhere. The same none-after-stress pattern existed **before** the synchronous-teardown / grace-0 fix (entry 17), so this is a measurement-window artifact, not leftover pods.
+
+**Root cause.** Linux PSI `avg10` is a ~10s decaying average, not an instantaneous gauge. (1) Confirmed pod `NotFound` after force-delete does not imply a clean baseline for the next trial — the average still carries the prior load. (2) Sampling shortly after the stress pod reaches Running (previously a 3s sleep) catches mid-ramp rather than steady state, so oversubscription ratios do not cleanly separate and TTFS can inherit timing noise.
+
+**Fix (timing only; randomization / grid unchanged).** Adaptive post-teardown cooldown: after cleanup, poll `CollectProcPressure` CPU `avg10` every ~2s until `< 3.0` or 30s timeout (warn + proceed on timeout). Then record `psi_cpu_avg10_pretrial_baseline` (CSV column added). Pre-measurement stress dwell after Running (CPU / memory / IO paths) increased to 12s so `avg10` can approach steady state before the landed PSI sample.
+
+**Lesson.** Teardown correctness (entry 17) and PSI sampling windows are independent isolation requirements. Treat `avg10` as a filtered signal with a multi-second time constant whenever trials share a node.
+
+---
+
+### 19. Automatic thermal-throttle recording (not Get-Counter frequency %)
+
+**What happened.** Two 18-trial pilot runs each left 1–2 trials with unexplained elevated TTFS. Manual inspection of the Windows System log showed the machine **has** thermally throttled before (Microsoft-Windows-Kernel-Processor-Power event ID 37), but both prior events fell hours outside either pilot’s wall-clock window — so heat does not explain those specific outliers. It does confirm throttling is real and recurring on this Hyper-V host.
+
+**Rejected approach.** `Get-Counter` “% of Maximum Frequency” stayed a flat ~90% through an entire real run under varying load — no usable signal here.
+
+**Fix.** Each trialrunner trial records host wall start/end and queries the System log for Kernel-Processor-Power ID 37 in that window (PowerShell `Get-WinEvent`). Fields: `thermal_throttle_events_during_trial` (count), `thermal_throttle_detected` (count > 0), written into detail and pilot CSV. Record-only — never fails or delays a trial; any exclusion is a later analysis decision.
+
+**Lesson.** Prefer event-log thermal evidence over frequency counters on this hardware; keep the harness observational so paper/analysis can document filter policy explicitly.
+
+

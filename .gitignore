@@ -46,3 +46,5 @@ experiments/results/calibration/*
 !experiments/results/calibration/.gitkeep
 experiments/results/evaluation/*
 !experiments/results/evaluation/.gitkeep
+experiments/results/pilot/*
+!experiments/results/pilot/.gitkeep

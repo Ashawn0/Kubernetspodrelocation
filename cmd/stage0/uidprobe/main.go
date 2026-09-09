@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -143,7 +142,7 @@ func main() {
 	}
 	loadCh := make(chan loadResult, 1)
 	go func() {
-		s, e := runClusterLoad(context.Background(), cs, cfg, *namespace, loadNode, svcURL, *workers, *loadSec)
+		s, e := disrupt.RunClusterLoad(context.Background(), cs, cfg, *namespace, loadNode, svcURL, *workers, *loadSec)
 		loadCh <- loadResult{s, e}
 	}()
 	time.Sleep(2 * time.Second) // let load establish old-UID traffic
@@ -177,7 +176,7 @@ func main() {
 	}
 	podCh := make(chan pollResult, 1)
 	go func() {
-		s, e := runPodIPPoll(ctx, cs, cfg, *namespace, loadNode, podURL, newUID, 90*time.Second)
+		s, e := disrupt.RunPodIPPoll(ctx, cs, cfg, *namespace, loadNode, podURL, newUID, 90*time.Second)
 		podCh <- pollResult{s, e}
 	}()
 
@@ -326,134 +325,6 @@ func main() {
 	if !allPass {
 		os.Exit(1)
 	}
-}
-
-func runClusterLoad(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, ns, node, url string, workers, sec int) ([]disrupt.Sample, error) {
-	script := fmt.Sprintf(`
-set -euo pipefail
-python3 - <<'PY'
-import json, time, urllib.request, concurrent.futures, threading
-from datetime import datetime, timezone
-URL = %q
-WORKERS = %d
-DURATION = %d
-out = []
-lock = threading.Lock()
-stop = time.time() + DURATION
-
-def ts():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def one(_):
-    while time.time() < stop:
-        try:
-            req = urllib.request.Request(URL, headers={"Connection": "close"})
-            with urllib.request.urlopen(req, timeout=2) as r:
-                uid = r.headers.get("X-Pod-Uid") or ""
-                status = r.status
-                _ = r.read()
-            err = ""
-        except Exception as e:
-            uid, status, err = "", 0, str(e)
-        with lock:
-            out.append({"at": ts(), "uid": uid, "status": status, "path": "clusterip", "err": err})
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-    list(ex.map(one, range(WORKERS)))
-print("SAMPLES_BEGIN")
-for s in out:
-    print(json.dumps(s))
-print("SAMPLES_END")
-PY
-`, url, workers, sec)
-	raw, err := k8s.HostExec(ctx, cs, cfg, ns, node, script, time.Duration(sec+120)*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("cluster load: %w\n%s", err, truncate(raw, 800))
-	}
-	return parseSamples(raw, "clusterip")
-}
-
-func runPodIPPoll(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, ns, node, url, wantUID string, timeout time.Duration) ([]disrupt.Sample, error) {
-	script := fmt.Sprintf(`
-set -euo pipefail
-python3 - <<'PY'
-import json, time, urllib.request
-from datetime import datetime, timezone
-URL = %q
-WANT = %q
-deadline = time.time() + %d
-out = []
-
-def ts():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-while time.time() < deadline:
-    try:
-        req = urllib.request.Request(URL, headers={"Connection": "close"})
-        with urllib.request.urlopen(req, timeout=2) as r:
-            uid = r.headers.get("X-Pod-Uid") or ""
-            status = r.status
-            _ = r.read()
-        err = ""
-    except Exception as e:
-        uid, status, err = "", 0, str(e)
-    out.append({"at": ts(), "uid": uid, "status": status, "path": "podip", "err": err})
-    if status == 200 and uid == WANT:
-        break
-    time.sleep(0.02)
-print("SAMPLES_BEGIN")
-for s in out:
-    print(json.dumps(s))
-print("SAMPLES_END")
-PY
-`, url, wantUID, int(timeout.Seconds()))
-	raw, err := k8s.HostExec(ctx, cs, cfg, ns, node, script, timeout+2*time.Minute)
-	if err != nil {
-		return parseSamples(raw, "podip")
-	}
-	return parseSamples(raw, "podip")
-}
-
-func parseSamples(raw, defaultPath string) ([]disrupt.Sample, error) {
-	var out []disrupt.Sample
-	in := false
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "SAMPLES_BEGIN" {
-			in = true
-			continue
-		}
-		if line == "SAMPLES_END" {
-			break
-		}
-		if !in || line == "" {
-			continue
-		}
-		var row struct {
-			At     string `json:"at"`
-			UID    string `json:"uid"`
-			Status int    `json:"status"`
-			Path   string `json:"path"`
-			Err    string `json:"err"`
-		}
-		if err := json.Unmarshal([]byte(line), &row); err != nil {
-			continue
-		}
-		t, err := time.Parse(time.RFC3339Nano, row.At)
-		if err != nil {
-			t, err = time.Parse(time.RFC3339, row.At)
-		}
-		if err != nil {
-			// python format may be odd; try best-effort
-			t = time.Now().UTC()
-		}
-		path := row.Path
-		if path == "" {
-			path = defaultPath
-		}
-		out = append(out, disrupt.Sample{At: t.UTC(), UID: row.UID, Status: row.Status, Path: path, Err: row.Err})
-	}
-	return out, nil
 }
 
 func curlUID(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, ns, node, url string, n int) (string, error) {

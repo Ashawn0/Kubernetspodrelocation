@@ -156,9 +156,19 @@ func KubeletNodePSI(ctx context.Context, cs *kubernetes.Clientset, node string) 
 	return nodeObj, nil
 }
 
-// StartCPUStress launches a foreground stress-ng pod oversubscribed 2:1 vs nproc.
+// StartCPUStress launches a foreground stress-ng pod oversubscribed 2:1 vs nproc
+// (Stage 0 isolation default). For other ratios use StartCPUStressRatio.
 func StartCPUStress(ctx context.Context, cs *kubernetes.Clientset, namespace, node string, nproc, durationSec int) (*corev1.Pod, int, error) {
-	workers := nproc * 2
+	return StartCPUStressRatio(ctx, cs, namespace, node, nproc, durationSec, 2)
+}
+
+// StartCPUStressRatio oversubscribes CPU workers at ratio:1 vs nproc
+// (threshold≈2, high≈3 for pilot variance cells).
+func StartCPUStressRatio(ctx context.Context, cs *kubernetes.Clientset, namespace, node string, nproc, durationSec, ratio int) (*corev1.Pod, int, error) {
+	if ratio < 1 {
+		ratio = 2
+	}
+	workers := nproc * ratio
 	if workers < 2 {
 		workers = 2
 	}
@@ -398,6 +408,7 @@ nsenter --target 1 --mount --uts --ipc --net --pid -- bash -c '
 }
 
 func stressPod(name, namespace, node string, args []string) *corev1.Pod {
+	grace0 := int64(0)
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -405,7 +416,8 @@ func stressPod(name, namespace, node string, args []string) *corev1.Pod {
 			Labels:    map[string]string{"app": "reloc-psiprobe-stress", "stage0": "true"},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			RestartPolicy:                 corev1.RestartPolicyNever,
+			TerminationGracePeriodSeconds: &grace0, // stress-ng: no shutdown work; avoid 30s bleed into next trial
 			Tolerations: []corev1.Toleration{{
 				Operator: corev1.TolerationOpExists,
 			}},
