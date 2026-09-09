@@ -9,15 +9,18 @@ Defaults: α = 0.05 → z_{α/2} = 1.96; power = 0.9 → z_β ≈ 1.2816.
 Power 0.9 (not the common 0.8) is intentional per the project's standing
 rigor directive -- underpowering the campaign is worse than a larger n.
 
-σ for the single headline recommendation is the *most conservative*
-(largest) cell sample standard deviation. δ is either supplied with
---delta or derived with --auto-delta from the smallest adjacent PSI-level
-mean gap within each image-cache state (then taking the global min).
+δ is either supplied with --delta (same value for every cache) or derived
+with --auto-delta from the smallest adjacent PSI-level mean gap *within
+each* image-cache state. Each cache uses its own delta for n and config
+rows; a global min across caches may be printed as FYI but never feeds
+sizing.
 
 --write-config PATH writes a local-VM-only campaign JSON (6 cells; no AWS)
 using per-cache-state recommended n (cold vs warm), after checking that
 within-cache PSI-level variances are not also heterogeneous at the same
 ratio threshold (would repeat the pooling mistake at finer grain).
+Recommended n above --max-replicates-flag (default 500) triggers a loud
+plausibility warning with wall-clock estimate at observed/assumed trial duration.
 
 Usage:
   python scripts/power_analysis.py path/to/pilot-variance.csv --delta 1.0
@@ -48,6 +51,10 @@ DEFAULT_Z_ALPHA_HALF = 1.96  # α = 0.05, two-sided
 DEFAULT_Z_BETA = 1.2816  # power = 0.9
 VARIANCE_RATIO_FLAG = 3.0
 SENSITIVITY_MULTS = (0.5, 1.0, 2.0, 3.0)
+# Plausibility: flag recommended replicate counts that would dominate wall-clock.
+# 500 trials × ~2 min/trial ≈ 17 h per cell before cal+eval doubling — rethink δ/α/power.
+DEFAULT_MAX_REPLICATES_FLAG = 500
+DEFAULT_TRIAL_WALL_SEC = 120.0  # fallback if timestamps unavailable
 
 
 def sample_mean_var_std(xs: list[float]) -> tuple[float, float, float]:
@@ -181,6 +188,60 @@ def split_cal_eval(recommended_n: int, cal_eval_ratio: float) -> tuple[int, int]
     return calibration_n, evaluation_n
 
 
+def estimate_trial_wall_sec(csv_path: Path, fallback: float = DEFAULT_TRIAL_WALL_SEC) -> float:
+    """Median positive inter-trial gap from ts_utc if present; else fallback seconds."""
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return fallback
+    if not rows or "ts_utc" not in (rows[0] or {}):
+        return fallback
+    from datetime import datetime
+
+    times: list[datetime] = []
+    for r in rows:
+        s = (r.get("ts_utc") or "").strip()
+        if not s:
+            continue
+        try:
+            times.append(datetime.fromisoformat(s.replace("Z", "+00:00")))
+        except ValueError:
+            continue
+    times.sort()
+    gaps = [(times[i] - times[i - 1]).total_seconds() for i in range(1, len(times))]
+    gaps = [g for g in gaps if 5.0 < g < 3600.0]  # ignore clock jumps / sub-second noise
+    if not gaps:
+        return fallback
+    gaps.sort()
+    return gaps[len(gaps) // 2]
+
+
+def flag_implausible_n(
+    *,
+    cell: str,
+    recommended_n: int,
+    cal_n: int,
+    eval_n: int,
+    trial_wall_sec: float,
+    max_replicates_flag: int,
+) -> None:
+    """Loud stderr warning when n exceeds the wall-clock plausibility budget."""
+    if recommended_n <= max_replicates_flag:
+        return
+    trials = cal_n + eval_n
+    hours = trials * trial_wall_sec / 3600.0
+    print(
+        f"\n*** PLAUSIBILITY FLAG: {cell} recommended_n={recommended_n} "
+        f"> {max_replicates_flag} (cal+eval={trials} trials) ***\n"
+        f"    At ~{trial_wall_sec:.0f}s observed/assumed wall per trial ≈ {hours:.1f} h "
+        f"for this cell alone.\n"
+        f"    Do not blindly run this: reconsider alpha/power/delta (or accept a "
+        f"larger detectable effect), not a multi-week cell.\n",
+        file=sys.stderr,
+    )
+
+
 def build_local_vm_config(
     *,
     cell_ns: dict[tuple[str, str], dict],
@@ -217,8 +278,8 @@ def main(argv: list[str] | None = None) -> int:
         "--auto-delta",
         action="store_true",
         help=(
-            "set delta from data: min |mean difference| between adjacent PSI "
-            "levels within each cache state; headline delta = min across caches"
+            "set delta from data: for each cache state, min |mean difference| "
+            "between adjacent PSI levels within that cache only (never cross-cache)"
         ),
     )
     p.add_argument("--alpha", type=float, default=0.05, help="two-sided type I error (default 0.05)")
@@ -262,6 +323,24 @@ def main(argv: list[str] | None = None) -> int:
             "calibration_n relative to recommended n "
             "(default 1.0 => calibration_n = evaluation_n = ceil(n); "
             "cal = ceil(n * ratio), eval = ceil(n))"
+        ),
+    )
+    p.add_argument(
+        "--max-replicates-flag",
+        type=int,
+        default=DEFAULT_MAX_REPLICATES_FLAG,
+        help=(
+            f"warn loudly if any cell recommended_n exceeds this "
+            f"(default {DEFAULT_MAX_REPLICATES_FLAG}); rethink alpha/power/delta"
+        ),
+    )
+    p.add_argument(
+        "--trial-wall-sec",
+        type=float,
+        default=None,
+        help=(
+            f"assumed wall-clock seconds per trial for plausibility hours "
+            f"(default: median inter-trial gap from ts_utc, else {DEFAULT_TRIAL_WALL_SEC:g})"
         ),
     )
     args = p.parse_args(argv)
@@ -322,8 +401,12 @@ def main(argv: list[str] | None = None) -> int:
         cache_stds[cache] = std
         print(f"{cache:<10} {len(xs):>4} {fmt(mean):>10} {fmt(var):>12} {fmt(std):>10}")
 
-    # --- resolve delta ---
+    # --- resolve per-cache deltas (never borrow warm delta to size cold) ---
+    # delta_by_cache[cache] is the ONLY delta used for that cache's n / config rows.
     auto_by_cache = auto_delta_by_cache(by_cell, sorted(by_cache.keys()))
+    delta_by_cache: dict[str, float] = {}
+    delta_source_by_cache: dict[str, str] = {}
+
     if args.auto_delta:
         if not auto_by_cache:
             raise SystemExit(
@@ -332,36 +415,39 @@ def main(argv: list[str] | None = None) -> int:
             )
         print()
         print("=== Auto-delta (adjacent PSI mean gaps within each cache state) ===")
+        print(
+            "Sizing rule: each cache state uses ITS OWN min adjacent gap as delta. "
+            "A global min across caches is FYI only and is never fed into n."
+        )
         for cache in sorted(auto_by_cache.keys()):
             d, a, b, ma, mb = auto_by_cache[cache]
+            delta_by_cache[cache] = d
+            delta_source_by_cache[cache] = (
+                f"auto-delta within {cache} ({cache}_{a} vs {cache}_{b})"
+            )
             print(
-                f"  {cache}: min |mean diff| = {fmt(d)}s "
+                f"  {cache}: sizing delta = {fmt(d)}s "
                 f"from {cache}_{a} (mean={fmt(ma)}) vs {cache}_{b} (mean={fmt(mb)})"
             )
             for gd, ga, gb, gma, gmb in adjacent_mean_gaps(by_cell, cache):
-                mark = "  <-- min" if (ga, gb) == (a, b) else ""
+                mark = "  <-- min (used for this cache)" if (ga, gb) == (a, b) else ""
                 print(
                     f"    |{cache}_{ga} - {cache}_{gb}| = {fmt(gd)}s "
                     f"(means {fmt(gma)}, {fmt(gmb)}){mark}"
                 )
-        chosen_delta = min(t[0] for t in auto_by_cache.values())
-        winners = [
-            (cache, auto_by_cache[cache])
-            for cache in sorted(auto_by_cache.keys())
-            if abs(auto_by_cache[cache][0] - chosen_delta) < 1e-15
-            or auto_by_cache[cache][0] == chosen_delta
-        ]
-        wcache, (wd, wa, wb, wma, wmb) = min(winners, key=lambda t: t[1][0])
+        fyi_min = min(delta_by_cache.values())
+        fyi_cache = min(delta_by_cache.keys(), key=lambda c: delta_by_cache[c])
         print(
-            f"headline delta (min across caches): {fmt(chosen_delta)}s "
-            f"[{wcache}_{wa} vs {wcache}_{wb}]"
+            f"FYI headline min across caches (NOT used for sizing): {fmt(fyi_min)}s "
+            f"[{fyi_cache}]"
         )
-        delta_source = "auto-delta"
     else:
         if args.delta is None or args.delta <= 0:
             raise SystemExit("--delta must be > 0")
-        chosen_delta = args.delta
-        delta_source = "manual --delta"
+        for cache in CACHE_ORDER:
+            if cache in by_cache:
+                delta_by_cache[cache] = args.delta
+                delta_source_by_cache[cache] = "manual --delta (same value for every cache)"
         if auto_by_cache:
             print()
             print("=== Adjacent PSI mean gaps (informational; --delta overrides) ===")
@@ -373,26 +459,36 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     print()
-    print(
-        f"chosen delta: {fmt(chosen_delta)}s ({delta_source})  "
-        f"alpha: {args.alpha}  power: {args.power}  z_a/2: {z_a}  z_b: {z_b}"
-    )
+    print(f"alpha: {args.alpha}  power: {args.power}  z_a/2: {z_a}  z_b: {z_b}")
+    for cache in CACHE_ORDER:
+        if cache not in delta_by_cache:
+            continue
+        print(
+            f"  sizing delta[{cache}] = {fmt(delta_by_cache[cache])}s "
+            f"({delta_source_by_cache[cache]})"
+        )
 
     finite_stds = [(lab, std) for lab, _, _, _, std in cell_stats if math.isfinite(std)]
     if not finite_stds:
         raise SystemExit("no cell has n>=2; cannot estimate sigma")
-    worst_label, worst_std = max(finite_stds, key=lambda t: t[1])
-    n_rec = n_per_group(worst_std, chosen_delta, z_a, z_b)
-    n_ceil = int(math.ceil(n_rec))
 
     print()
-    print("=== Recommended n (most conservative cell std, chosen delta) ===")
-    print(f"largest cell std: {fmt(worst_std)}  (cell={worst_label})")
-    print(f"n_per_group (continuous): {fmt(n_rec, 2)}")
-    print(f"n_per_group (ceil):       {n_ceil}")
+    print("=== Recommended n by cache (own delta x cache-pooled sigma) ===")
+    for cache in CACHE_ORDER:
+        if cache not in delta_by_cache or cache not in cache_stds:
+            continue
+        d = delta_by_cache[cache]
+        std = cache_stds[cache]
+        if not math.isfinite(std):
+            continue
+        n_c = n_per_group(std, d, z_a, z_b)
+        print(
+            f"  {cache}: sigma={fmt(std)}  delta={fmt(d)}s  "
+            f"n_per_group ceil={int(math.ceil(n_c))}"
+        )
     print(
-        "Interpretation: equal-n two-sample comparison of means with the "
-        "stated alpha/power/delta, using the largest per-cell sample SD as sigma."
+        "Interpretation: equal-n two-sample comparison at the stated alpha/power, "
+        "with sigma and delta both taken within the same cache state."
     )
 
     cold_v = cache_vars.get("cold")
@@ -414,21 +510,12 @@ def main(argv: list[str] | None = None) -> int:
                 "prefer per-cache-state replicate sizing rather than one pooled n "
                 "for the whole 6-cell grid (see docs/campaign-design.md section 2)."
             )
-            for cache in ("cold", "warm"):
-                std = cache_stds.get(cache, float("nan"))
-                if math.isfinite(std):
-                    n_c = n_per_group(std, chosen_delta, z_a, z_b)
-                    print(
-                        f"  if sized on {cache}-pooled sigma={fmt(std)} at chosen delta: "
-                        f"n_per_group ceil={int(math.ceil(n_c))}"
-                    )
         else:
             print(
                 f"(ratio < {args.variance_ratio_flag:g}x -- single grid-wide n may be defensible; "
                 "still review campaign-design section 2 structural cold-pull variance.)"
             )
 
-    # --- within-cache PSI variance (do not silently pool none/threshold/high) ---
     print()
     print("=== Within-cache PSI variance (none vs threshold vs high) ===")
     within_flags: dict[str, float] = {}
@@ -453,49 +540,61 @@ def main(argv: list[str] | None = None) -> int:
                 "one n per cache state across PSI levels is defensible."
             )
 
-    # --- sensitivity table ---
     print()
     print(
         "=== Sensitivity: n_per_group (ceil) vs delta multipliers "
-        "(per-cache pooled sigma) ==="
+        "(per-cache pooled sigma x that cache sizing delta) ==="
     )
     print(
-        "Uses cold-pooled and warm-pooled sample SD separately "
-        "(not the single largest-cell sigma). Suitable for methodology tradeoff tables."
+        "Each row uses that cache's own sizing delta as the 1.0x base "
+        "(not a cross-cache headline min)."
     )
     mult_hdr = " ".join(f"{'d*' + fmt(m, 1):>10}" for m in SENSITIVITY_MULTS)
-    print(f"{'cache':<8} {'sigma':>10} {mult_hdr}")
-    abs_hdr = " ".join(f"{fmt(chosen_delta * m, 3):>10}" for m in SENSITIVITY_MULTS)
-    print(f"{'':<8} {'':>10} {abs_hdr}")
-    print("-" * (8 + 10 + 1 + 11 * len(SENSITIVITY_MULTS)))
-    for cache in sorted(cache_stds.keys()):
+    print(f"{'cache':<8} {'sigma':>10} {'delta':>10} {mult_hdr}")
+    print("-" * (8 + 10 + 10 + 1 + 11 * len(SENSITIVITY_MULTS)))
+    for cache in CACHE_ORDER:
+        if cache not in cache_stds or cache not in delta_by_cache:
+            continue
         std = cache_stds[cache]
+        base_d = delta_by_cache[cache]
         if not math.isfinite(std):
             continue
         cells = []
         for m in SENSITIVITY_MULTS:
-            d = chosen_delta * m
+            d = base_d * m
             n_c = n_per_group(std, d, z_a, z_b)
             cells.append(f"{int(math.ceil(n_c)):>10}")
-        print(f"{cache:<8} {fmt(std):>10} {' '.join(cells)}")
+        print(f"{cache:<8} {fmt(std):>10} {fmt(base_d):>10} {' '.join(cells)}")
 
-    # --- optional campaign config write ---
+    trial_wall = (
+        args.trial_wall_sec
+        if args.trial_wall_sec is not None
+        else estimate_trial_wall_sec(args.csv)
+    )
+    max_rep_flag = args.max_replicates_flag
+    print()
+    print(
+        f"plausibility: flag recommended_n > {max_rep_flag} "
+        f"at ~{trial_wall:.0f}s/trial wall"
+    )
+
     if args.write_config is not None:
         cache_n: dict[str, int] = {}
         for cache in CACHE_ORDER:
             std = cache_stds.get(cache)
-            if std is None or not math.isfinite(std):
+            d = delta_by_cache.get(cache)
+            if std is None or not math.isfinite(std) or d is None:
                 raise SystemExit(
-                    f"--write-config: need finite pooled std for cache={cache!r} "
-                    f"(n>=2 trials in that cache state)"
+                    f"--write-config: need finite pooled std and sizing delta for cache={cache!r}"
                 )
-            cache_n[cache] = int(math.ceil(n_per_group(std, chosen_delta, z_a, z_b)))
+            cache_n[cache] = int(math.ceil(n_per_group(std, d, z_a, z_b)))
 
         cell_meta: dict[tuple[str, str], dict] = {}
         used_per_psi = False
         for cache in CACHE_ORDER:
             wratio = within_flags.get(cache, float("nan"))
             use_per_psi = math.isfinite(wratio) and wratio >= args.variance_ratio_flag
+            d = delta_by_cache[cache]
             if use_per_psi:
                 used_per_psi = True
                 print()
@@ -505,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(
                     "    Sizing each PSI cell from its own cell std "
-                    "(not silent pool). Review before treating as final campaign n."
+                    f"at this cache delta={fmt(d)}s (not silent pool)."
                 )
             for psi in PSI_ORDER:
                 key = (cache, psi)
@@ -516,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
                             f"--write-config: cell {cache}_{psi} needs n>=2 for "
                             "per-PSI sizing after within-cache FLAG"
                         )
-                    rec_n = int(math.ceil(n_per_group(cstd, chosen_delta, z_a, z_b)))
+                    rec_n = int(math.ceil(n_per_group(cstd, d, z_a, z_b)))
                     sigma_src = f"cell_std({cache}_{psi})={fmt(cstd)}"
                     pool = "per-psi (within-cache FLAG)"
                 else:
@@ -530,27 +629,37 @@ def main(argv: list[str] | None = None) -> int:
                     "evaluation_n": eval_n,
                     "sigma_source": sigma_src,
                     "pool": pool,
+                    "delta": d,
+                    "delta_source": delta_source_by_cache[cache],
                 }
+                flag_implausible_n(
+                    cell=f"{cache}_{psi}",
+                    recommended_n=rec_n,
+                    cal_n=cal_n,
+                    eval_n=eval_n,
+                    trial_wall_sec=trial_wall,
+                    max_replicates_flag=max_rep_flag,
+                )
 
         print()
         print("=== Campaign config preview (local-VM only; aws_cells=[]) ===")
         print(
-            f"delta={fmt(chosen_delta)}s ({delta_source})  "
             f"cal_eval_ratio={args.cal_eval_ratio:g}  "
-            f"(cal=ceil(n*ratio), eval=ceil(n))"
+            f"(cal=ceil(n*ratio), eval=ceil(n)); deltas are per-cache"
         )
         preview_hdr = (
-            f"{'cell':<18} {'rec_n':>5} {'cal_n':>5} {'eval_n':>6}  "
+            f"{'cell':<18} {'delta':>8} {'rec_n':>6} {'cal_n':>6} {'eval_n':>6}  "
             f"{'variance / n source'}"
         )
         print(preview_hdr)
-        print("-" * max(len(preview_hdr), 72))
+        print("-" * max(len(preview_hdr), 78))
         for cache in CACHE_ORDER:
             for psi in PSI_ORDER:
                 m = cell_meta[(cache, psi)]
                 print(
-                    f"{cache + '_' + psi:<18} {m['recommended_n']:>5} "
-                    f"{m['calibration_n']:>5} {m['evaluation_n']:>6}  "
+                    f"{cache + '_' + psi:<18} {fmt(m['delta']):>8} "
+                    f"{m['recommended_n']:>6} {m['calibration_n']:>6} "
+                    f"{m['evaluation_n']:>6}  "
                     f"{m['pool']}; {m['sigma_source']}"
                 )
         if used_per_psi:
@@ -568,8 +677,10 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "(AWS cells omitted intentionally -- add manually after live netshape verification.)"
         )
+        print(json.dumps(cfg, indent=2))
 
     return 0
+
 
 
 if __name__ == "__main__":
