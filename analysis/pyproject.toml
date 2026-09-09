@@ -5,13 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "relocdisrupt"
 version = "0.0.0"
-description = "Analysis package for reloc-disrupt (empty of models at Stage 0)"
+description = "Analysis package for reloc-disrupt (LightGBM + pilot power tools)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest"]
+lgbm = ["numpy", "lightgbm"]
+power = []  # scripts/power_analysis.py is stdlib-only
 
 [tool.setuptools.packages.find]
 where = ["src"]

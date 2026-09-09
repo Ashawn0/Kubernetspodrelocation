@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "oracle_selected_cell": "cell_oracle",
+  "oracle_raw_cal_cost": 1.8,
+  "oracle_corrected_cost": 2.0,
+  "oracle_eval_cost": 2.1,
+  "oracle_eval_n": 4,
+  "oracle_shrinkage_alpha": 0.5,
+  "oracle_prior_mean": 5.0,
+  "cells": [
+    {
+      "cell_id": "cell_a",
+      "cal_mean": 9.0,
+      "cal_n": 4,
+      "eval_mean": 10.0,
+      "eval_n": 4,
+      "baseline_predictions": {
+        "fixed-cost": 7.0,
+        "ImageLocality": 9.0
+      },
+      "representative_features_ok": true
+    },
+    {
+      "cell_id": "cell_b",
+      "cal_mean": 5.5,
+      "cal_n": 4,
+      "eval_mean": 6.0,
+      "eval_n": 4,
+      "baseline_predictions": {
+        "fixed-cost": 7.0,
+        "ImageLocality": 4.0
+      },
+      "representative_features_ok": true
+    },
+    {
+      "cell_id": "cell_c",
+      "cal_mean": 2.5,
+      "cal_n": 4,
+      "eval_mean": 3.0,
+      "eval_n": 4,
+      "baseline_predictions": {
+        "fixed-cost": 7.0,
+        "ImageLocality": 5.0
+      },
+      "representative_features_ok": true
+    }
+  ]
+}

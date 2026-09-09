@@ -51,3 +51,6 @@ experiments/results/evaluation/*
 !experiments/results/evaluation/.gitkeep
 experiments/results/pilot/*
 !experiments/results/pilot/.gitkeep
+
+# Paper draft lives outside the tracked repo (Overleaf / local only)
+paper/

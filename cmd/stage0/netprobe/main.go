@@ -16,6 +16,7 @@ import (
 
 	"reloc-disrupt/internal/k8s"
 	"reloc-disrupt/internal/logevent"
+	"reloc-disrupt/internal/netshape"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -118,26 +119,22 @@ func main() {
 	}
 	record("baseline_measured", true, baseline, nil)
 
-	shapeCmd := fmt.Sprintf(`
-set -euo pipefail
-IF=%q
-PRI=%q
-DELAY=%d
-RATE=%d
-if [[ "$IF" == "$PRI" ]]; then echo "refuse shape primary"; exit 1; fi
-tc qdisc del dev "$IF" root 2>/dev/null || true
-tc qdisc add dev "$IF" root handle 1: tbf rate "${RATE}mbit" burst 32kbit latency 400ms
-tc qdisc add dev "$IF" parent 1:1 handle 10: netem delay "${DELAY}ms"
-tc qdisc show dev "$IF"
-`, *registryIF, *primaryIF, *delayMS, *rateMbit)
+	shapeProfile := netshape.Profile{
+		Level:    -1, // ad-hoc Stage 0 shape (delay+rate flags), not a §7 campaign level
+		Name:     "netprobe",
+		DelayMS:  *delayMS,
+		RateMbit: *rateMbit,
+	}
+	shapeCmd, err := netshape.ApplyScript(*registryIF, *primaryIF, shapeProfile)
+	must(err)
 	_, err = k8s.HostExec(ctx, cs, cfg, *namespace, a, shapeCmd, 2*time.Minute)
 	must(err)
 	_, err = k8s.HostExec(ctx, cs, cfg, *namespace, b, shapeCmd, 2*time.Minute)
 	must(err)
 	defer func() {
-		clear := fmt.Sprintf("tc qdisc del dev %q root 2>/dev/null || true", *registryIF)
-		_, _ = k8s.HostExec(context.Background(), cs, cfg, *namespace, a, clear, time.Minute)
-		_, _ = k8s.HostExec(context.Background(), cs, cfg, *namespace, b, clear, time.Minute)
+		bg := context.Background()
+		_, _, _ = netshape.ClearAndWait(bg, cs, cfg, *namespace, a, *registryIF, time.Second, 30*time.Second)
+		_, _, _ = netshape.ClearAndWait(bg, cs, cfg, *namespace, b, *registryIF, time.Second, 30*time.Second)
 	}()
 
 	time.Sleep(2 * time.Second)

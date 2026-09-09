@@ -1,0 +1,104 @@
+{
+  "local_vm_cells": [
+    {
+      "image_cache_state": "cold",
+      "cpu_psi_level": "none",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "cold",
+      "cpu_psi_level": "threshold",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "cold",
+      "cpu_psi_level": "high",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "warm",
+      "cpu_psi_level": "none",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "warm",
+      "cpu_psi_level": "threshold",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "warm",
+      "cpu_psi_level": "high",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": true
+    }
+  ],
+  "aws_cells": [
+    {
+      "network_level": 0,
+      "cpu_psi_level": "none",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 0,
+      "cpu_psi_level": "high",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 1,
+      "cpu_psi_level": "none",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 1,
+      "cpu_psi_level": "high",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 2,
+      "cpu_psi_level": "none",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 2,
+      "cpu_psi_level": "high",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 3,
+      "cpu_psi_level": "none",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    },
+    {
+      "network_level": 3,
+      "cpu_psi_level": "high",
+      "calibration_n": 1,
+      "evaluation_n": 1,
+      "held_out": false
+    }
+  ]
+}

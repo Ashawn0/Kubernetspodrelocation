@@ -1,3 +1,4 @@
 # Campaign configs
 
-Placeholder. Do not run a campaign from Stage 0.
+Canonical example + notes: [`../config/`](../config/)
+(`campaign-config.example.json`). Placeholder counts only — real *n* from power analysis.

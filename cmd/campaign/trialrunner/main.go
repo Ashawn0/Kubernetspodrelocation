@@ -1,8 +1,10 @@
 // Command trialrunner runs campaign-style disruption trials.
 //
-//	-mode dryrun  — short timing check (≤4 cells), split=dryrun
-//	-mode pilot   — variance estimation: 6 cells × 15 replicates (90 trials),
-//	                randomized order, split=pilot → experiments/results/pilot/
+//	-mode dryrun    — short timing check (≤4 cells), split=dryrun
+//	-mode pilot     — variance estimation: 6 cells × N replicates, split=pilot
+//	                  → experiments/results/pilot/ (do not touch live pilot outputs)
+//	-mode campaign  — config-driven cal/eval grid (-campaign-config), seeded shuffle,
+//	                  split=calibration|evaluation → experiments/results/{calibration,evaluation}/
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"reloc-disrupt/internal/disrupt"
 	"reloc-disrupt/internal/k8s"
 	"reloc-disrupt/internal/logevent"
+	"reloc-disrupt/internal/netshape"
 	"reloc-disrupt/internal/nodeobs"
 	"reloc-disrupt/internal/place"
 
@@ -58,34 +61,46 @@ const (
 )
 
 type trialSpec struct {
-	TrialID          string
-	CellName         string
-	ImageCacheState  cacheKind
-	CPUPSILevel      cpuPSILevel
-	CPURatio         int // 0 = no stress; 2 = threshold; 3 = high
-	Replicate        int
-	ExecOrder        int
+	TrialID         string
+	CellName        string
+	ImageCacheState cacheKind
+	CPUPSILevel     cpuPSILevel
+	CPURatio        int // 0 = no stress; 2 = threshold; 3 = high
+	Replicate       int
+	ExecOrder       int
+	// Split is assigned before execution for campaign (calibration|evaluation).
+	// Pilot/dryrun set this via trialOpts.Split instead (or leave empty).
+	Split string
+	// Infra is "local_vm" | "aws" for campaign rows; empty for pilot/dryrun.
+	Infra string
+	// NetworkLevel is 0–3 for AWS cells; -1 when N/A (local-VM / pilot).
+	NetworkLevel int
+	// HeldOut marks evaluation-only generalization cells (calibration_n forced 0).
+	HeldOut bool
 	// Dry-run only extras (memory/io):
 	ExtraPSI string // "", "memory", "io"
 }
 
 func main() {
 	var (
-		mode       = flag.String("mode", "dryrun", "dryrun | pilot")
-		kubeconfig = flag.String("kubeconfig", "", "path to kubeconfig")
-		namespace  = flag.String("namespace", "reloc-stage0", "namespace")
-		outPath    = flag.String("out", "", "output path (defaults per mode)")
-		image      = flag.String("image", "", "full cache-state image ref; empty = registry reloc/app-a:v1")
-		imageRepo  = flag.String("image-repo", "reloc/app-a", "repo when -image empty")
-		ioPath     = flag.String("io-path", "/mnt/reloc-nvme", "NVMe path for dryrun IO cell")
-		skipIO     = flag.Bool("skip-io", true, "dryrun: replace IO cell with warm+cpu")
-		preStop    = flag.Int("prestop-sec", 12, "preStop sleep")
-		grace      = flag.Int("grace-sec", 20, "terminationGracePeriodSeconds")
-		workers    = flag.Int("load-workers", 8, "HostExec Connection:close workers")
-		loadSec    = flag.Int("load-sec", 35, "ClusterIP load duration seconds")
-		stressSec  = flag.Int("stress-sec", 90, "PSI stress duration (cover disrupt+measure)")
-		seedFlag   = flag.Int64("seed", 0, "pilot PRNG seed (0 = derive from time; always logged)")
-		replicates = flag.Int("replicates", 15, "pilot replicates per cell")
+		mode           = flag.String("mode", "dryrun", "dryrun | pilot | campaign")
+		kubeconfig     = flag.String("kubeconfig", "", "path to kubeconfig")
+		namespace      = flag.String("namespace", "reloc-stage0", "namespace")
+		outPath        = flag.String("out", "", "output path (dryrun/pilot; campaign uses cal/eval defaults)")
+		campaignConfig = flag.String("campaign-config", "", "campaign mode: path to JSON cell/replicate config")
+		image          = flag.String("image", "", "full cache-state image ref; empty = registry reloc/app-a:v1")
+		imageRepo      = flag.String("image-repo", "reloc/app-a", "repo when -image empty")
+		ioPath         = flag.String("io-path", "/mnt/reloc-nvme", "NVMe path for dryrun IO cell")
+		skipIO         = flag.Bool("skip-io", true, "dryrun: replace IO cell with warm+cpu")
+		preStop        = flag.Int("prestop-sec", 12, "preStop sleep")
+		grace          = flag.Int("grace-sec", 20, "terminationGracePeriodSeconds")
+		workers        = flag.Int("load-workers", 8, "HostExec Connection:close workers")
+		loadSec        = flag.Int("load-sec", 35, "ClusterIP load duration seconds")
+		stressSec      = flag.Int("stress-sec", 90, "PSI stress duration (cover disrupt+measure)")
+		seedFlag       = flag.Int64("seed", 0, "pilot/campaign PRNG seed (0 = derive from time; always logged)")
+		replicates     = flag.Int("replicates", 15, "pilot replicates per cell")
+		registryIface  = flag.String("registry-iface", netshape.DefaultRegistryIface, "AWS registry secondary iface (tc target)")
+		primaryIface   = flag.String("primary-iface", netshape.DefaultPrimaryIface, "AWS primary CNI iface (never shaped)")
 	)
 	flag.Parse()
 
@@ -110,19 +125,21 @@ func main() {
 	}
 
 	base := trialOpts{
-		Namespace: *namespace,
-		Target:    target,
-		LoadNode:  loadNode,
-		Image:     cacheImage,
-		Registry:  regHost,
-		Repo:      repo,
-		Tag:       tag,
-		IOPath:    *ioPath,
-		PreStop:   *preStop,
-		Grace:     *grace,
-		Workers:   *workers,
-		LoadSec:   *loadSec,
-		StressSec: *stressSec,
+		Namespace:     *namespace,
+		Target:        target,
+		LoadNode:      loadNode,
+		Image:         cacheImage,
+		Registry:      regHost,
+		Repo:          repo,
+		Tag:           tag,
+		IOPath:        *ioPath,
+		PreStop:       *preStop,
+		Grace:         *grace,
+		Workers:       *workers,
+		LoadSec:       *loadSec,
+		StressSec:     *stressSec,
+		RegistryIface: *registryIface,
+		PrimaryIface:  *primaryIface,
 	}
 
 	switch strings.ToLower(*mode) {
@@ -137,8 +154,16 @@ func main() {
 			*outPath = fmt.Sprintf("experiments/results/pilot/pilot-variance-%s.csv", day)
 		}
 		runPilot(ctx, cs, cfg, base, *outPath, *seedFlag, *replicates)
+	case "campaign":
+		if *campaignConfig == "" {
+			fail("campaign mode requires -campaign-config path/to/config.json")
+		}
+		day := time.Now().UTC().Format("20060102")
+		calOut := fmt.Sprintf("experiments/results/calibration/campaign-%s.csv", day)
+		evalOut := fmt.Sprintf("experiments/results/evaluation/campaign-%s.csv", day)
+		runCampaign(ctx, cs, cfg, base, *campaignConfig, calOut, evalOut, *seedFlag)
 	default:
-		fail("unknown -mode " + *mode + " (want dryrun|pilot)")
+		fail("unknown -mode " + *mode + " (want dryrun|pilot|campaign)")
 	}
 }
 
@@ -332,6 +357,164 @@ func runPilot(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, b
 	fmt.Printf("results: %s\n", outPath)
 }
 
+// runCampaign executes a config-driven cal/eval schedule using the same
+// runOneTrial path as pilot (teardown, PSI cooldown, dwell, thermal, host CPU).
+func runCampaign(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, base trialOpts, configPath, calOut, evalOut string, seedFlag int64) {
+	ccfg, err := loadCampaignConfig(configPath)
+	must(err)
+	seed := seedFlag
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+	baseSpecs, err := buildCampaignSchedule(ccfg)
+	must(err)
+	specs := shuffleCampaignSchedule(baseSpecs, seed)
+
+	must(os.MkdirAll(filepath.Dir(calOut), 0o755))
+	must(os.MkdirAll(filepath.Dir(evalOut), 0o755))
+	calF, err := os.Create(calOut)
+	must(err)
+	defer calF.Close()
+	evalF, err := os.Create(evalOut)
+	must(err)
+	defer evalF.Close()
+	calW := csv.NewWriter(calF)
+	evalW := csv.NewWriter(evalF)
+	header := campaignCSVHeader()
+	must(calW.Write(header))
+	must(evalW.Write(header))
+	calW.Flush()
+	evalW.Flush()
+
+	nCal, nEval := 0, 0
+	for _, sp := range specs {
+		switch sp.Split {
+		case "calibration":
+			nCal++
+		case "evaluation":
+			nEval++
+		}
+	}
+	fmt.Printf("trialrunner campaign: %d trials (cal=%d eval=%d), seed=%d\n", len(specs), nCal, nEval, seed)
+	fmt.Printf("config: %s\n", configPath)
+	fmt.Printf("calibration out: %s\n", calOut)
+	fmt.Printf("evaluation out:  %s\n", evalOut)
+	fmt.Printf("target=%s loadNode=%s cache_image=%s\n", base.Target, base.LoadNode, base.Image)
+	totalStart := time.Now()
+
+	for _, sp := range specs {
+		opt := base
+		opt.Spec = sp
+		opt.Split = sp.Split // calibration | evaluation — never "pilot"
+		opt.SkipKeepAlive = true
+		opt.Seed = seed
+		trialStart := time.Now()
+		fmt.Printf("\n=== [%d/%d] %s cell=%s split=%s infra=%s cache=%s cpu=%s net=%s rep=%d held_out=%v ===\n",
+			sp.ExecOrder, len(specs), sp.TrialID, sp.CellName, sp.Split, sp.Infra,
+			sp.ImageCacheState, sp.CPUPSILevel, networkLevelCSV(sp), sp.Replicate, sp.HeldOut)
+		rec, runErr := runOneTrial(ctx, cs, cfg, opt)
+		elapsed := time.Since(trialStart).Seconds()
+		ts := time.Now().UTC().Format(time.RFC3339Nano)
+		pass := runErr == nil
+		errStr := ""
+		if runErr != nil {
+			errStr = runErr.Error()
+			fmt.Printf("FAIL (%.1fs): %v\n", elapsed, runErr)
+		} else {
+			fmt.Printf("PASS (%.1fs) ttfs_cip=%.3fs ttfs_pip=%.3fs naive=%.3fs\n",
+				elapsed,
+				num(rec.Detail["ttfs_clusterip_sec"]),
+				num(rec.Detail["ttfs_podip_sec"]),
+				num(rec.Detail["ttfs_naive_clusterip_sec"]))
+		}
+		row := campaignCSVRow(sp, seed, base, rec, pass, errStr, ts)
+		var w *csv.Writer
+		switch sp.Split {
+		case "calibration":
+			w = calW
+		case "evaluation":
+			w = evalW
+		default:
+			fail("campaign trial missing split: " + sp.TrialID)
+		}
+		must(w.Write(row))
+		w.Flush()
+		if err := w.Error(); err != nil {
+			fail(err.Error())
+		}
+	}
+	fmt.Printf("\n=== campaign complete: %d trials, seed=%d, total wall %.1fs ===\n",
+		len(specs), seed, time.Since(totalStart).Seconds())
+	fmt.Printf("calibration: %s\n", calOut)
+	fmt.Printf("evaluation:  %s\n", evalOut)
+}
+
+func campaignCSVHeader() []string {
+	return []string{
+		"trial_id", "split", "seed", "exec_order", "replicate",
+		"infra", "cell_name", "held_out",
+		"image_cache_state", "cpu_psi_level", "cpu_oversubscribe_ratio", "network_level",
+		"ttfs_clusterip_sec", "ttfs_podip_sec", "ttfs_naive_clusterip_sec",
+		"ts_utc", "pass", "error",
+		"uncached_bytes", "psi_cpu_avg10", "psi_cpu_avg10_pretrial_baseline",
+		"thermal_throttle_events_during_trial", "thermal_throttle_detected",
+		"host_cpu_pct_start", "host_cpu_pct_end",
+		"target_node", "cache_image",
+	}
+}
+
+func networkLevelCSV(sp trialSpec) string {
+	if sp.Infra != infraAWS || sp.NetworkLevel < 0 {
+		return ""
+	}
+	return strconv.Itoa(sp.NetworkLevel)
+}
+
+func campaignCSVRow(sp trialSpec, seed int64, base trialOpts, rec logevent.Record, pass bool, errStr, ts string) []string {
+	unc := ""
+	avg10 := ""
+	preBaseline := ""
+	if landed, ok := rec.Detail["confirmed_landed"].(map[string]any); ok {
+		if v, ok := landed["uncached_bytes"]; ok {
+			unc = fmt.Sprint(v)
+		}
+		if v, ok := landed["psi_cpu_avg10"]; ok {
+			avg10 = fmt.Sprint(v)
+		}
+	}
+	if v, ok := rec.Detail["psi_cpu_avg10_pretrial_baseline"]; ok {
+		preBaseline = fmt.Sprint(v)
+	}
+	thEvents := "0"
+	thDet := "false"
+	if v, ok := rec.Detail["thermal_throttle_events_during_trial"]; ok {
+		thEvents = fmt.Sprint(v)
+	}
+	if v, ok := rec.Detail["thermal_throttle_detected"]; ok {
+		if b, ok := v.(bool); ok {
+			thDet = strconv.FormatBool(b)
+		} else {
+			thDet = fmt.Sprint(v)
+		}
+	}
+	hostStart := ""
+	hostEnd := ""
+	if v, ok := rec.Detail["host_cpu_pct_start"]; ok {
+		hostStart = fmtNum(v)
+	}
+	if v, ok := rec.Detail["host_cpu_pct_end"]; ok {
+		hostEnd = fmtNum(v)
+	}
+	return []string{
+		sp.TrialID, sp.Split, strconv.FormatInt(seed, 10), strconv.Itoa(sp.ExecOrder), strconv.Itoa(sp.Replicate),
+		sp.Infra, sp.CellName, strconv.FormatBool(sp.HeldOut),
+		string(sp.ImageCacheState), string(sp.CPUPSILevel), strconv.Itoa(sp.CPURatio), networkLevelCSV(sp),
+		fmtNum(rec.Detail["ttfs_clusterip_sec"]), fmtNum(rec.Detail["ttfs_podip_sec"]), fmtNum(rec.Detail["ttfs_naive_clusterip_sec"]),
+		ts, strconv.FormatBool(pass), errStr,
+		unc, avg10, preBaseline, thEvents, thDet, hostStart, hostEnd, base.Target, base.Image,
+	}
+}
+
 type trialOpts struct {
 	Namespace     string
 	Target        string
@@ -350,6 +533,8 @@ type trialOpts struct {
 	Spec          trialSpec
 	Seed          int64
 	SkipKeepAlive bool
+	RegistryIface string // AWS secondary ENI (tc target)
+	PrimaryIface  string // AWS primary CNI (never shaped)
 }
 
 func runOneTrial(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config, opt trialOpts) (rec logevent.Record, err error) {
@@ -365,6 +550,13 @@ func runOneTrial(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config
 		"target_node":             opt.Target,
 		"image":                   opt.Image,
 		"cache_image_note":        "reloc ground-truth image; not pause/sandbox",
+	}
+	if sp.Infra != "" {
+		detail["infra"] = sp.Infra
+		detail["held_out"] = sp.HeldOut
+		if sp.Infra == infraAWS && sp.NetworkLevel >= 0 {
+			detail["network_level"] = sp.NetworkLevel
+		}
 	}
 	if opt.Seed != 0 {
 		detail["seed"] = opt.Seed
@@ -406,10 +598,25 @@ func runOneTrial(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config
 	}
 
 	var stressPod string
+	shapeApplied := false
 	defer func() {
 		bg := context.Background()
 		if stressPod != "" {
 			if e := deletePodGone(bg, cs, opt.Namespace, stressPod, deleteGoneTimeout); e != nil && err == nil {
+				err = e
+			}
+		}
+		// Network shaping is node-level tc state, not a pod — confirm clear before
+		// the next trial (same discipline as deletePodGone / PSI cooldown).
+		if shapeApplied {
+			regIF := opt.RegistryIface
+			if regIF == "" {
+				regIF = netshape.DefaultRegistryIface
+			}
+			last, timedOut, e := netshape.ClearAndWait(bg, cs, cfg, opt.Namespace, opt.Target, regIF, time.Second, 30*time.Second)
+			detail["netshape_clear_last_qdisc"] = strings.TrimSpace(last)
+			detail["netshape_clear_timed_out"] = timedOut
+			if e != nil && err == nil {
 				err = e
 			}
 		}
@@ -435,6 +642,34 @@ func runOneTrial(ctx context.Context, cs *kubernetes.Clientset, cfg *rest.Config
 	}
 
 	setupStart := time.Now()
+
+	// AWS campaign cells: apply registry-iface shaping (§7 levels) before cache
+	// prep so cold pulls observe the impairment. LIVE UNVERIFIED until next AWS
+	// provision — see internal/netshape package comment.
+	if sp.Infra == infraAWS && sp.NetworkLevel >= 0 {
+		regIF := opt.RegistryIface
+		priIF := opt.PrimaryIface
+		if regIF == "" {
+			regIF = netshape.DefaultRegistryIface
+		}
+		if priIF == "" {
+			priIF = netshape.DefaultPrimaryIface
+		}
+		prof, out, shapeErr := netshape.EnsureLevel(ctx, cs, cfg, opt.Namespace, opt.Target, regIF, priIF, sp.NetworkLevel)
+		if shapeErr != nil {
+			return rec, fmt.Errorf("netshape level %d: %w", sp.NetworkLevel, shapeErr)
+		}
+		shapeApplied = true
+		detail["netshape_level"] = prof.Level
+		detail["netshape_name"] = prof.Name
+		detail["netshape_delay_ms"] = prof.DelayMS
+		detail["netshape_rate_mbit"] = prof.RateMbit
+		detail["netshape_registry_iface"] = regIF
+		detail["netshape_primary_iface"] = priIF
+		detail["netshape_apply_out"] = strings.TrimSpace(out)
+		detail["netshape_live_verified"] = false // no AWS cluster tonight
+		detail["netshape_intent"] = prof.IntentNote
+	}
 
 	switch sp.ImageCacheState {
 	case cacheCold:
