@@ -14,15 +14,23 @@ rigor directive -- underpowering the campaign is worse than a larger n.
 --delta or derived with --auto-delta from the smallest adjacent PSI-level
 mean gap within each image-cache state (then taking the global min).
 
+--write-config PATH writes a local-VM-only campaign JSON (6 cells; no AWS)
+using per-cache-state recommended n (cold vs warm), after checking that
+within-cache PSI-level variances are not also heterogeneous at the same
+ratio threshold (would repeat the pooling mistake at finer grain).
+
 Usage:
   python scripts/power_analysis.py path/to/pilot-variance.csv --delta 1.0
   python scripts/power_analysis.py path/to/pilot-variance.csv --auto-delta
+  python scripts/power_analysis.py path/to/pilot-variance.csv --auto-delta \\
+      --write-config experiments/config/campaign-from-pilot.json
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 from collections import defaultdict
@@ -34,6 +42,7 @@ PSI_COL = "cpu_psi_level"
 
 # Adjacent PSI ladder for the local-VM grid (none < threshold < high).
 PSI_ORDER = ("none", "threshold", "high")
+CACHE_ORDER = ("cold", "warm")
 
 DEFAULT_Z_ALPHA_HALF = 1.96  # α = 0.05, two-sided
 DEFAULT_Z_BETA = 1.2816  # power = 0.9
@@ -126,6 +135,73 @@ def auto_delta_by_cache(
     return out
 
 
+def within_cache_psi_variance_ratio(
+    by_cell: dict[tuple[str, str], list[float]], cache: str
+) -> tuple[float, dict[str, float]]:
+    """Max/min sample-variance ratio across PSI levels within one cache state.
+
+    Returns (ratio, {psi: variance}) using only levels with n>=2 finite var.
+    ratio is nan if fewer than two usable levels.
+    """
+    vars_by_psi: dict[str, float] = {}
+    for psi in PSI_ORDER:
+        xs = by_cell.get((cache, psi), [])
+        _, var, _ = sample_mean_var_std(xs)
+        if math.isfinite(var) and var >= 0:
+            vars_by_psi[psi] = var
+    if len(vars_by_psi) < 2:
+        return float("nan"), vars_by_psi
+    vals = list(vars_by_psi.values())
+    lo = min(vals)
+    if lo <= 0:
+        hi = max(vals)
+        return (float("inf") if hi > 0 else 1.0), vars_by_psi
+    return max(vals) / lo, vars_by_psi
+
+
+def split_cal_eval(recommended_n: int, cal_eval_ratio: float) -> tuple[int, int]:
+    """Map a recommended per-group n into (calibration_n, evaluation_n).
+
+    Absent a specific reason to weight calibration and evaluation differently, a
+    symmetric split (ratio=1) is the simplest defensible default: both the
+    oracle's Smith-Winkler shrinkage (cal cell means) and the evaluation-side
+    power target benefit from comparably precise cell-mean estimates. Adjust
+    only via --cal-eval-ratio with a stated reason -- never silently.
+    """
+    if recommended_n < 1:
+        raise ValueError("recommended_n must be >= 1")
+    if cal_eval_ratio <= 0:
+        raise ValueError("cal_eval_ratio must be > 0")
+    evaluation_n = int(math.ceil(recommended_n))
+    calibration_n = int(math.ceil(recommended_n * cal_eval_ratio))
+    if calibration_n < 1:
+        calibration_n = 1
+    if evaluation_n < 1:
+        evaluation_n = 1
+    return calibration_n, evaluation_n
+
+
+def build_local_vm_config(
+    *,
+    cell_ns: dict[tuple[str, str], dict],
+) -> dict:
+    """Campaign-mode schema: local_vm_cells only; aws_cells empty (not provisioned)."""
+    cells = []
+    for cache in CACHE_ORDER:
+        for psi in PSI_ORDER:
+            meta = cell_ns[(cache, psi)]
+            cells.append(
+                {
+                    "image_cache_state": cache,
+                    "cpu_psi_level": psi,
+                    "calibration_n": meta["calibration_n"],
+                    "evaluation_n": meta["evaluation_n"],
+                    "held_out": False,
+                }
+            )
+    return {"local_vm_cells": cells, "aws_cells": []}
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Replicate sizing from reloc-disrupt pilot CSV (ttfs_clusterip_sec).",
@@ -163,7 +239,30 @@ def main(argv: list[str] | None = None) -> int:
         "--variance-ratio-flag",
         type=float,
         default=VARIANCE_RATIO_FLAG,
-        help=f"flag cold/warm variance ratio above this (default {VARIANCE_RATIO_FLAG})",
+        help=(
+            f"flag cold/warm (and within-cache PSI) variance ratio above this "
+            f"(default {VARIANCE_RATIO_FLAG})"
+        ),
+    )
+    p.add_argument(
+        "--write-config",
+        type=Path,
+        default=None,
+        help=(
+            "write a local-VM campaign JSON (6 cells; aws_cells=[]) with per-cache "
+            "recommended n; uses per-PSI n when within-cache variance ratio exceeds "
+            "--variance-ratio-flag (never silently pool)"
+        ),
+    )
+    p.add_argument(
+        "--cal-eval-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "calibration_n relative to recommended n "
+            "(default 1.0 => calibration_n = evaluation_n = ceil(n); "
+            "cal = ceil(n * ratio), eval = ceil(n))"
+        ),
     )
     args = p.parse_args(argv)
 
@@ -181,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
             "pass --z-beta for a matching quantile",
             file=sys.stderr,
         )
+    if args.write_config is not None and args.cal_eval_ratio <= 0:
+        raise SystemExit("--cal-eval-ratio must be > 0")
 
     rows = load_costs(args.csv)
 
@@ -199,11 +300,13 @@ def main(argv: list[str] | None = None) -> int:
     print(hdr)
     print("-" * len(hdr))
     cell_stats: list[tuple[str, int, float, float, float]] = []
+    cell_stds: dict[tuple[str, str], float] = {}
     for cache, psi in sorted(by_cell.keys()):
         xs = by_cell[(cache, psi)]
         mean, var, std = sample_mean_var_std(xs)
         label = f"{cache}_{psi}"
         cell_stats.append((label, len(xs), mean, var, std))
+        cell_stds[(cache, psi)] = std
         print(f"{label:<22} {len(xs):>4} {fmt(mean):>10} {fmt(var):>12} {fmt(std):>10}")
 
     print()
@@ -235,7 +338,6 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {cache}: min |mean diff| = {fmt(d)}s "
                 f"from {cache}_{a} (mean={fmt(ma)}) vs {cache}_{b} (mean={fmt(mb)})"
             )
-            # Also list all adjacent gaps for traceability
             for gd, ga, gb, gma, gmb in adjacent_mean_gaps(by_cell, cache):
                 mark = "  <-- min" if (ga, gb) == (a, b) else ""
                 print(
@@ -243,7 +345,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"(means {fmt(gma)}, {fmt(gmb)}){mark}"
                 )
         chosen_delta = min(t[0] for t in auto_by_cache.values())
-        # Identify which cache/pair produced the global min
         winners = [
             (cache, auto_by_cache[cache])
             for cache in sorted(auto_by_cache.keys())
@@ -327,7 +428,32 @@ def main(argv: list[str] | None = None) -> int:
                 "still review campaign-design section 2 structural cold-pull variance.)"
             )
 
-    # --- sensitivity table: per-cache sigma, multipliers of chosen delta ---
+    # --- within-cache PSI variance (do not silently pool none/threshold/high) ---
+    print()
+    print("=== Within-cache PSI variance (none vs threshold vs high) ===")
+    within_flags: dict[str, float] = {}
+    for cache in CACHE_ORDER:
+        if cache not in by_cache:
+            continue
+        wratio, vars_by_psi = within_cache_psi_variance_ratio(by_cell, cache)
+        within_flags[cache] = wratio
+        bits = ", ".join(
+            f"{psi} var={fmt(vars_by_psi[psi])}" for psi in PSI_ORDER if psi in vars_by_psi
+        )
+        print(f"  {cache}: max/min var ratio = {fmt(wratio, 2)}x  [{bits}]")
+        if math.isfinite(wratio) and wratio >= args.variance_ratio_flag:
+            print(
+                f"  FLAG: {cache} within-cache PSI variance ratio >= {args.variance_ratio_flag:g}x -- "
+                "do NOT apply one n to all three PSI levels for this cache "
+                "(same pooling mistake as cold/warm, finer grain)."
+            )
+        elif math.isfinite(wratio):
+            print(
+                f"  ok: {cache} within-cache ratio < {args.variance_ratio_flag:g}x -- "
+                "one n per cache state across PSI levels is defensible."
+            )
+
+    # --- sensitivity table ---
     print()
     print(
         "=== Sensitivity: n_per_group (ceil) vs delta multipliers "
@@ -339,7 +465,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     mult_hdr = " ".join(f"{'d*' + fmt(m, 1):>10}" for m in SENSITIVITY_MULTS)
     print(f"{'cache':<8} {'sigma':>10} {mult_hdr}")
-    # second header row with absolute deltas
     abs_hdr = " ".join(f"{fmt(chosen_delta * m, 3):>10}" for m in SENSITIVITY_MULTS)
     print(f"{'':<8} {'':>10} {abs_hdr}")
     print("-" * (8 + 10 + 1 + 11 * len(SENSITIVITY_MULTS)))
@@ -353,6 +478,96 @@ def main(argv: list[str] | None = None) -> int:
             n_c = n_per_group(std, d, z_a, z_b)
             cells.append(f"{int(math.ceil(n_c)):>10}")
         print(f"{cache:<8} {fmt(std):>10} {' '.join(cells)}")
+
+    # --- optional campaign config write ---
+    if args.write_config is not None:
+        cache_n: dict[str, int] = {}
+        for cache in CACHE_ORDER:
+            std = cache_stds.get(cache)
+            if std is None or not math.isfinite(std):
+                raise SystemExit(
+                    f"--write-config: need finite pooled std for cache={cache!r} "
+                    f"(n>=2 trials in that cache state)"
+                )
+            cache_n[cache] = int(math.ceil(n_per_group(std, chosen_delta, z_a, z_b)))
+
+        cell_meta: dict[tuple[str, str], dict] = {}
+        used_per_psi = False
+        for cache in CACHE_ORDER:
+            wratio = within_flags.get(cache, float("nan"))
+            use_per_psi = math.isfinite(wratio) and wratio >= args.variance_ratio_flag
+            if use_per_psi:
+                used_per_psi = True
+                print()
+                print(
+                    f"*** REFUSING uniform-n for cache={cache}: within-PSI variance "
+                    f"ratio {fmt(wratio, 2)}x >= {args.variance_ratio_flag:g}x ***"
+                )
+                print(
+                    "    Sizing each PSI cell from its own cell std "
+                    "(not silent pool). Review before treating as final campaign n."
+                )
+            for psi in PSI_ORDER:
+                key = (cache, psi)
+                if use_per_psi:
+                    cstd = cell_stds.get(key, float("nan"))
+                    if not math.isfinite(cstd):
+                        raise SystemExit(
+                            f"--write-config: cell {cache}_{psi} needs n>=2 for "
+                            "per-PSI sizing after within-cache FLAG"
+                        )
+                    rec_n = int(math.ceil(n_per_group(cstd, chosen_delta, z_a, z_b)))
+                    sigma_src = f"cell_std({cache}_{psi})={fmt(cstd)}"
+                    pool = "per-psi (within-cache FLAG)"
+                else:
+                    rec_n = cache_n[cache]
+                    sigma_src = f"cache_pooled_std({cache})={fmt(cache_stds[cache])}"
+                    pool = f"cache-pooled ({cache})"
+                cal_n, eval_n = split_cal_eval(rec_n, args.cal_eval_ratio)
+                cell_meta[key] = {
+                    "recommended_n": rec_n,
+                    "calibration_n": cal_n,
+                    "evaluation_n": eval_n,
+                    "sigma_source": sigma_src,
+                    "pool": pool,
+                }
+
+        print()
+        print("=== Campaign config preview (local-VM only; aws_cells=[]) ===")
+        print(
+            f"delta={fmt(chosen_delta)}s ({delta_source})  "
+            f"cal_eval_ratio={args.cal_eval_ratio:g}  "
+            f"(cal=ceil(n*ratio), eval=ceil(n))"
+        )
+        preview_hdr = (
+            f"{'cell':<18} {'rec_n':>5} {'cal_n':>5} {'eval_n':>6}  "
+            f"{'variance / n source'}"
+        )
+        print(preview_hdr)
+        print("-" * max(len(preview_hdr), 72))
+        for cache in CACHE_ORDER:
+            for psi in PSI_ORDER:
+                m = cell_meta[(cache, psi)]
+                print(
+                    f"{cache + '_' + psi:<18} {m['recommended_n']:>5} "
+                    f"{m['calibration_n']:>5} {m['evaluation_n']:>6}  "
+                    f"{m['pool']}; {m['sigma_source']}"
+                )
+        if used_per_psi:
+            print()
+            print(
+                "NOTE: one or more caches used per-PSI n because within-cache "
+                "variance heterogeneity met the FLAG threshold."
+            )
+
+        cfg = build_local_vm_config(cell_ns=cell_meta)
+        args.write_config.parent.mkdir(parents=True, exist_ok=True)
+        args.write_config.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        print()
+        print(f"wrote campaign config: {args.write_config}")
+        print(
+            "(AWS cells omitted intentionally -- add manually after live netshape verification.)"
+        )
 
     return 0
 

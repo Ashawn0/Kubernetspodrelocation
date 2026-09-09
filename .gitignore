@@ -51,6 +51,9 @@ experiments/results/evaluation/*
 !experiments/results/evaluation/.gitkeep
 experiments/results/pilot/*
 !experiments/results/pilot/.gitkeep
+# Finished 90-trial variance pilot (2026-09-09); keep general ignore for in-progress runs.
+!experiments/results/pilot/pilot-variance-20260909.csv
+!experiments/results/pilot/pilot-variance-20260909.power-analysis.txt
 
 # Proxy integration-check outputs (labeled PROXY; not campaign results)
 experiments/results/integration-check/*

@@ -1,0 +1,47 @@
+{
+  "local_vm_cells": [
+    {
+      "image_cache_state": "cold",
+      "cpu_psi_level": "none",
+      "calibration_n": 13250,
+      "evaluation_n": 13250,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "cold",
+      "cpu_psi_level": "threshold",
+      "calibration_n": 6948,
+      "evaluation_n": 6948,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "cold",
+      "cpu_psi_level": "high",
+      "calibration_n": 22912,
+      "evaluation_n": 22912,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "warm",
+      "cpu_psi_level": "none",
+      "calibration_n": 278,
+      "evaluation_n": 278,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "warm",
+      "cpu_psi_level": "threshold",
+      "calibration_n": 278,
+      "evaluation_n": 278,
+      "held_out": false
+    },
+    {
+      "image_cache_state": "warm",
+      "cpu_psi_level": "high",
+      "calibration_n": 278,
+      "evaluation_n": 278,
+      "held_out": false
+    }
+  ],
+  "aws_cells": []
+}

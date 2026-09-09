@@ -2,5 +2,5 @@
 
 Cluster bring-up is `deploy/local-vm/provision-cluster.ps1`, not this directory.
 
-- `power_analysis.py` — pilot CSV replicate sizing (`--delta` required). See `docs/campaign-design.md` §6.
+- `power_analysis.py` — pilot CSV replicate sizing (`--delta` / `--auto-delta`). Optional campaign JSON with `--write-config` (local-VM cells only). See `docs/campaign-design.md` §6.
 - `proxy_integration_check.py` — PROXY-only end-to-end GapCaptured plumbing check (§10). Not a campaign result.
