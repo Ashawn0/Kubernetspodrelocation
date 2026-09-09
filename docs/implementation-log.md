@@ -229,3 +229,15 @@ Both AWS-only Stage 0 gates closed with measured magnitudes, not booleans alone:
 - **`netprobe`:** pass — primary iface ≈ +0.00 ms RTT / +0.1% BW (noise; isolated); registry iface +200.04 ms RTT / −100% BW (matches 100 ms netem + 20 Mbit tbf by design).
 
 **Stage 0 is closed.** Next: experimental campaign (LightGBM training, calibration/evaluation replicate split, GapCaptured) — not started.
+
+---
+
+### 16. `.gitattributes` LF rules do not rewrite already-committed CRLF
+
+**What happened.** `*.sh text eol=lf` (and `paths.env`) was already in `.gitattributes`, but `deploy/registry/configure-insecure-registry.sh` still produced the classic bash CRLF diagnostic (dollar-single-quote backslash-r / `command not found` on `\r`) under `multipass exec ... bash` on Ubuntu. Working-tree bytes had CRLF; with `core.autocrlf=true`, `git status` stayed clean because the clean filter hides CR on compare.
+
+**Root cause.** Adding an `eol=lf` attribute does **not** retroactively rewrite blobs or refresh working trees that already carried CRLF (or that an editor re-saved as CRLF after checkout). Attributes apply to new checkins/checkouts; a one-time renormalization (and/or an explicit LF rewrite of the working tree) is required for pre-existing files.
+
+**Fix.** Ran `git add --renormalize .` against the existing rules. Index/HEAD blobs for tracked `*.sh` / `paths.env` were already LF (nothing new to commit for those objects). Rewrote the dirty working-tree copy of `configure-insecure-registry.sh` (and `.gitattributes`) to LF and re-audited every tracked `.sh` for CR bytes — none remain.
+
+**Lesson.** Whenever an `eol=` rule is added, or a shell script is suspected of stale line endings: (1) `git add --renormalize .`, (2) byte-audit `*.sh` for CR (`\r`), (3) commit any resulting index changes as their own commit. Do not assume `.gitattributes` alone healed files that were wrong before the rule landed.
