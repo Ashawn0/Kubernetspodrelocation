@@ -90,6 +90,18 @@ This directly addresses post-decision optimism from selecting the apparent best 
 
 **Still open:** ImageLocality → cost map (affine OLS placeholder in `internal/baseline`; may need isotonic or cold/warm table once campaign data exists). Mean vs median aggregation remains swappable via `AggregateFn` (default **mean**).
 
+**ImageLocality `NumNodes` — resolved under a verified placement contract (2026-09-09).**
+
+Kube-scheduler ImageLocality scores present images with spread `NumNodes/TotalNodes`. A full multi-node inventory is unnecessary for this harness because:
+
+- Forced placement (`nodeSelector` → `opt.Target`) always lands the app pod on the target worker.
+- Load generation / TTFS polling runs on `opt.LoadNode` only; that node never runs app-a/app-b pods.
+- Empirically verified **2026-09-09**: `crictl images` on worker2 (LoadNode) showed neither ground-truth image present.
+
+Therefore presence of the trial image is fully determined by the target’s already-tracked cache cell: **warm ⇒ `NumNodesWithImage = 1`**, **cold ⇒ absent (0)**. `evalexport.featuresFromCacheRow` synthesizes `PresentImages` that way explicitly (not `NumNodes=TotalNodes`). This is **exact under the contract**, not an approximation from partial inventory. Placement invariants are guarded by `cmd/campaign/trialrunner` source tests; if Target/LoadNode roles change, those tests fail and the synthesis must be revisited.
+
+What is still *not* claimed: a full CRI inventory of unrelated images on the node (unnecessary while the pod requests only the ground-truth image). Size bytes in the synthetic present entry remain an OLS-scale placeholder until measured sizes are persisted.
+
 ---
 
 ## 6. Replicate sizing (pending final *n*)
@@ -258,21 +270,39 @@ AWS config has **no** `image_cache_state` field (`DisallowUnknownFields` rejects
 
 ---
 
+## 10. Proxy end-to-end integration check (2026-09-09)
+
+**Finding before this work:** `internal/evalexport` only accepted in-process `[]baseline.Trial` (no CSV on disk). Real campaign analysis needs disk loaders for `experiments/results/{calibration,evaluation}/` CSVs, so CSV ingest was added as a general capability (`evalexport.LoadTrialsCSV`), not a one-off test hack.
+
+**What was verified:** the finished 18-trial smoke pilot CSV (`analysis/testdata/pilot-variance-18trial-smoke.csv` — **not** the live 90-trial `experiments/results/pilot/pilot-variance-20260909.csv`) was run through:
+
+1. Go CSV load → artificial per-cell split (replicates **1–2** calibration, **3** evaluation)  
+2. baseline Fit + Smith–Winkler oracle + JSON export (`cmd/analysis/proxycheck`)  
+3. Python LightGBM Fit on the same calibration rows + `regret.py` GapCaptured (`scripts/proxy_integration_check.py`)
+
+**Labeling:** every artifact is marked **PROXY INTEGRATION CHECK** (`proxy_integration_check: true`, filenames under `experiments/results/integration-check/proxy-*`). The artificial split is plumbing only — **not** a methodological choice and **not** a preliminary GapCaptured result.
+
+**Interface note:** pilot `split=pilot` is cleared on load so `PartitionByReplicate` can assign real cal/eval labels; ImageLocality `PresentImages` use target-only `NumNodes=1` under the verified Target/LoadNode contract (§5).
+
+---
+
 ## Related code
 
 | Path | Role |
 | --- | --- |
 | `cmd/campaign/trialrunner` | dryrun + pilot + **campaign**; isolation, cooldown, dwell, thermal, host CPU; config schedule; AWS netshape hook |
+| `cmd/analysis/proxycheck` | PROXY-only: pilot CSV → oracle-baseline export (artificial split) |
+| `scripts/proxy_integration_check.py` | PROXY-only: export + LightGBM + GapCaptured end-to-end |
 | `internal/netshape` | reusable registry-ENI tc apply/clear (from netprobe); §7 levels; clear-verify poll |
 | `experiments/config/campaign-config.example.json` | illustrative campaign grid (fake *n*) |
 | `internal/baseline` | `fixed-cost`, `ImageLocality`, shared `Predictor` |
 | `internal/oracle` | cal/eval partition + Smith–Winkler (2006) EB bias correction |
-| `internal/evalexport` | JSON dump of baseline preds + corrected oracle for Python |
+| `internal/evalexport` | CSV load + JSON dump of baseline preds + corrected oracle for Python |
 | `docs/references.md` | load-bearing citation tracking (Methodology / Related Work) |
 | `analysis/src/relocdisrupt/lgbm.py` | LightGBM Q50/Q95 log-cost predictor scaffold |
 | `analysis/src/relocdisrupt/regret.py` | load export → regret → GapCaptured |
 | `scripts/power_analysis.py` | pilot CSV → variance tables + recommended *n* |
 | `experiments/results/pilot/` | pilot CSV outputs (gitignored contents; live runs — leave alone) |
+| `experiments/results/integration-check/` | PROXY plumbing outputs only (gitignored contents) |
 | `experiments/results/calibration/` | campaign calibration CSV |
 | `experiments/results/evaluation/` | campaign evaluation CSV |
-| `paper/main.tex` | CCGrid draft (Overleaf Intro/RW/Method + Results/Discussion shells) |

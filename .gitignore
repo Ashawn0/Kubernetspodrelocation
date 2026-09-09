@@ -52,5 +52,9 @@ experiments/results/evaluation/*
 experiments/results/pilot/*
 !experiments/results/pilot/.gitkeep
 
+# Proxy integration-check outputs (labeled PROXY; not campaign results)
+experiments/results/integration-check/*
+!experiments/results/integration-check/.gitkeep
+
 # Paper draft lives outside the tracked repo (Overleaf / local only)
 paper/

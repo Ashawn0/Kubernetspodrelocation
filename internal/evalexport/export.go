@@ -42,6 +42,11 @@ type Export struct {
 	OracleShrinkageAlpha  float64      `json:"oracle_shrinkage_alpha"`
 	OraclePriorMean       float64      `json:"oracle_prior_mean"`
 	Cells                 []CellRecord `json:"cells"`
+	// ProxyIntegrationCheck marks artificial-split plumbing checks so they can
+	// never be mistaken for campaign GapCaptured results.
+	ProxyIntegrationCheck bool   `json:"proxy_integration_check,omitempty"`
+	ProxyNote             string `json:"proxy_note,omitempty"`
+	SourceCSV             string `json:"source_csv,omitempty"`
 }
 
 // Build constructs an Export from partitioned (or partitionable) trials.
