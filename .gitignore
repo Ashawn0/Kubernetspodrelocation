@@ -7,6 +7,9 @@ Thumbs.db
 
 # Credentials / local cluster configs (never commit)
 admin.conf
+admin.conf*
+admin.from-cp
+admin.from-cp*
 *.kubeconfig
 *.kubeconfig.*
 .env
