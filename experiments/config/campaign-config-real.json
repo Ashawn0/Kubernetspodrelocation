@@ -1,24 +1,25 @@
 {
+  "_pending_approval_note": "These replicate counts are the CORRECTED auto-delta sizing (bug fixed 2026-09-09), but total campaign trial count (~4,700 trials across cal+eval, 100+ hours) is impractically large as computed, because auto-delta targets the smallest observed adjacent-condition gap rather than a deliberately chosen practically-meaningful effect size. NOT YET APPROVED FOR USE, pending a decision on what delta should actually represent for this campaign.",
   "local_vm_cells": [
     {
       "image_cache_state": "cold",
       "cpu_psi_level": "none",
-      "calibration_n": 13250,
-      "evaluation_n": 13250,
+      "calibration_n": 467,
+      "evaluation_n": 467,
       "held_out": false
     },
     {
       "image_cache_state": "cold",
       "cpu_psi_level": "threshold",
-      "calibration_n": 6948,
-      "evaluation_n": 6948,
+      "calibration_n": 245,
+      "evaluation_n": 245,
       "held_out": false
     },
     {
       "image_cache_state": "cold",
       "cpu_psi_level": "high",
-      "calibration_n": 22912,
-      "evaluation_n": 22912,
+      "calibration_n": 806,
+      "evaluation_n": 806,
       "held_out": false
     },
     {
